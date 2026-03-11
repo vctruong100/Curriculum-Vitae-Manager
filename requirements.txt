@@ -1,0 +1,12 @@
+# CV Research Experience Manager - Dependencies
+# Offline-only application - no network dependencies
+# py -m pip install -r requirements.txt
+# py -m pip install pyinstaller
+# py -m PyInstaller --onefile --windowed --name "CV_Manager" --icon=icon.ico launcher.pyw
+
+python-docx>=0.8.11
+openpyxl>=3.1.2
+rapidfuzz>=3.5.0
+
+# Development / testing (install with: pip install -r requirements.txt)
+pytest>=7.0.0
