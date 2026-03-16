@@ -161,6 +161,21 @@ Examples:
         help='Output structured JSON instead of plain text'
     )
     
+    sort_group = parser.add_mutually_exclusive_group()
+    sort_group.add_argument(
+        '--sort-existing',
+        action='store_true',
+        default=None,
+        dest='sort_existing',
+        help='Sort all studies including existing ones (default behavior)'
+    )
+    sort_group.add_argument(
+        '--no-sort-existing',
+        action='store_false',
+        dest='sort_existing',
+        help='Only sort newly inserted studies; preserve existing CV order'
+    )
+    
     args = parser.parse_args()
     
     if args.mode == 'gui':
@@ -303,9 +318,23 @@ Examples:
     master_path = Path(args.master) if args.master else None
     output_path = Path(args.output) if args.output else None
     
+    # Resolve enable_sort_existing: CLI flag > config default
+    enable_sort_existing = args.sort_existing
+    if enable_sort_existing is None:
+        enable_sort_existing = config.enable_sort_existing
+    logging.getLogger(__name__).info(
+        "CLI: enable_sort_existing=%s (cli_flag=%s, config=%s)",
+        enable_sort_existing,
+        args.sort_existing,
+        config.enable_sort_existing,
+    )
+    
     if args.preview:
         mode = "update_inject" if args.mode == "update" else "redact_protocols"
-        changes, error = processor.preview_changes(cv_path, master_path, args.site, mode)
+        changes, error = processor.preview_changes(
+            cv_path, master_path, args.site, mode,
+            enable_sort_existing=enable_sort_existing,
+        )
         
         if error:
             if args.json:
@@ -327,7 +356,11 @@ Examples:
         return
     
     if args.mode == 'update':
-        result = processor.mode_a_update_inject(cv_path, master_path, args.site, output_path)
+        result = processor.mode_a_update_inject(
+            cv_path, master_path, args.site,
+            output_path=output_path,
+            enable_sort_existing=enable_sort_existing,
+        )
     else:  # redact
         result = processor.mode_b_redact_protocols(cv_path, master_path, args.site, output_path)
     

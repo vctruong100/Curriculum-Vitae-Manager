@@ -2,9 +2,12 @@
 Data models for the CV Research Experience Manager.
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import datetime
+
+from normalizer import normalize_heading_key, normalize_subcat_key
 
 
 @dataclass
@@ -28,12 +31,14 @@ class Study:
     def get_identity_tuple(self, normalized_masked: str = "") -> tuple:
         """
         Get the identity tuple for deduplication.
-        (Phase, Subcategory, Year, Sponsor, Protocol?, DescriptionMaskedNormalized)
+        Phase and Subcategory are normalized so that casing, spacing, and
+        Roman-numeral variants are treated as identical.
+        (PhaseKey, SubcatKey, Year, Sponsor, Protocol?, DescriptionMaskedNormalized)
         """
         masked = normalized_masked or self.description_masked
         return (
-            self.phase,
-            self.subcategory,
+            normalize_heading_key(self.phase),
+            normalize_subcat_key(self.subcategory),
             self.year,
             self.sponsor,
             self.protocol or "",
@@ -85,12 +90,30 @@ class Phase:
             sc.sort_studies()
     
     def get_or_create_subcategory(self, name: str) -> Subcategory:
-        """Get existing subcategory or create new one."""
+        """Get existing subcategory or create new one.
+
+        Matching uses normalize_subcat_key (NFC, casefold, whitespace
+        collapse, dash/quote canonicalization).  The *first* variant
+        seen becomes the persisted display name.
+        """
+        key = normalize_subcat_key(name)
         for sc in self.subcategories:
-            if sc.name.lower() == name.lower():
+            if normalize_subcat_key(sc.name) == key:
+                logging.debug(
+                    "[Models] Matched existing subcategory '%s' "
+                    "(key='%s') for requested '%s'",
+                    sc.name,
+                    key,
+                    name,
+                )
                 return sc
         new_sc = Subcategory(name=name)
         self.subcategories.append(new_sc)
+        logging.debug(
+            "[Models] Created new subcategory '%s' (key='%s')",
+            name,
+            key,
+        )
         return new_sc
 
 
@@ -102,10 +125,10 @@ class ResearchExperience:
     
     def get_phase_order_key(self, phase_name: str) -> int:
         """Get sort key for phase ordering (Phase I first, then Phase II-IV, Uncategorized last)."""
-        name_lower = phase_name.lower()
-        if "uncategorized" in name_lower:
-            return 99  # Always last
-        if "phase i" in name_lower and "ii" not in name_lower:
+        key = normalize_heading_key(phase_name)
+        if key == "Uncategorized":
+            return 99
+        if key == "Phase I":
             return 0
         return 1
     
@@ -151,12 +174,31 @@ class ResearchExperience:
             subcat.studies.sort(key=lambda s: (-s.year, s.sponsor, s.protocol))
     
     def get_or_create_phase(self, name: str) -> Phase:
-        """Get existing phase or create new one."""
+        """Get existing phase or create new one.
+
+        Matching uses normalize_heading_key (NFC, casefold, whitespace
+        collapse, dash/quote canonicalization, Roman-numeral equivalence
+        via PHASE_SYNONYMS).  The *first* variant seen becomes the
+        persisted display name.
+        """
+        key = normalize_heading_key(name)
         for p in self.phases:
-            if p.name.lower() == name.lower():
+            if normalize_heading_key(p.name) == key:
+                logging.debug(
+                    "[Models] Matched existing phase '%s' "
+                    "(key='%s') for requested '%s'",
+                    p.name,
+                    key,
+                    name,
+                )
                 return p
         new_phase = Phase(name=name)
         self.phases.append(new_phase)
+        logging.debug(
+            "[Models] Created new phase '%s' (key='%s')",
+            name,
+            key,
+        )
         return new_phase
     
     def get_all_studies(self) -> List[Study]:

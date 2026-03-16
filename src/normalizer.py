@@ -22,6 +22,61 @@ PHASE_PATTERNS = [
     (r'\bPhase\s*2\s*[-–—]\s*4\b', 'Phase II–IV'),
 ]
 
+# PHASE_SYNONYMS — maps every known casefolded variant to the canonical name.
+# Used exclusively for matching keys; persisted text is never altered.
+# Add new synonyms here if additional phase names are introduced.
+PHASE_SYNONYMS = {
+    # Phase I
+    "phase i": "Phase I",
+    "phase 1": "Phase I",
+    "phase i.": "Phase I",
+    "phase1": "Phase I",
+    # Phase II
+    "phase ii": "Phase II",
+    "phase 2": "Phase II",
+    "phase ii.": "Phase II",
+    "phase2": "Phase II",
+    # Phase III
+    "phase iii": "Phase III",
+    "phase 3": "Phase III",
+    "phase iii.": "Phase III",
+    "phase3": "Phase III",
+    # Phase IV
+    "phase iv": "Phase IV",
+    "phase 4": "Phase IV",
+    "phase iv.": "Phase IV",
+    "phase4": "Phase IV",
+    # Phase II-IV (various dash forms collapse to en-dash canonical)
+    "phase ii-iv": "Phase II\u2013IV",
+    "phase ii\u2013iv": "Phase II\u2013IV",
+    "phase ii\u2014iv": "Phase II\u2013IV",
+    "phase 2-4": "Phase II\u2013IV",
+    "phase 2\u20134": "Phase II\u2013IV",
+    "phase 2\u20144": "Phase II\u2013IV",
+    # Uncategorized
+    "uncategorized": "Uncategorized",
+}
+
+def normalize_heading_key(text: str) -> str:
+    """Normalize a heading key for matching purposes."""
+    text = unicodedata.normalize('NFC', text)
+    text = text.casefold()
+    text = re.sub(r'[\s\t]+', ' ', text).strip()
+    text = re.sub(r'[–—−‐‑‒―]', '-', text)
+    text = re.sub(r'["\u2018\u2019\u201a\u201b]', "'", text)
+    text = re.sub(r'["\u201c\u201d\u201e\u201f]', '"', text)
+    return PHASE_SYNONYMS.get(text, text)
+
+def normalize_subcat_key(text: str) -> str:
+    """Normalize a subcategory key for matching purposes."""
+    text = unicodedata.normalize('NFC', text)
+    text = text.casefold()
+    text = re.sub(r'[\s\t]+', ' ', text).strip()
+    text = re.sub(r'[–—−‐‑‒―]', '-', text)
+    text = re.sub(r'["\u2018\u2019\u201a\u201b]', "'", text)
+    text = re.sub(r'["\u201c\u201d\u201e\u201f]', '"', text)
+    return PHASE_SYNONYMS.get(text, text)
+
 # Protocol detection regex
 PROTOCOL_REGEX = re.compile(r'([A-Za-z]{1,10}-?\d[\w-]*)')
 
@@ -496,26 +551,38 @@ def is_phase_heading(text: str) -> Optional[str]:
     """
     Check if text is a phase heading and return normalized phase name.
     Returns None if not a phase heading.
+    
+    Uses normalize_heading_key for robust matching against PHASE_SYNONYMS,
+    then falls back to regex-based detection for partial matches.
     """
     text = text.strip()
+    if not text:
+        return None
+
+    # Fast path: exact synonym lookup via normalize_heading_key
+    key = normalize_heading_key(text)
+    if key in (
+        "Phase I", "Phase II", "Phase III", "Phase IV",
+        "Phase II\u2013IV", "Uncategorized",
+    ):
+        return key
+
+    # Fallback: apply normalize_phase regex patterns then check
     normalized = normalize_phase(text)
-    
-    # Check for known phase patterns
     if re.match(r'^Phase\s+I(?:\s|$)', normalized, re.IGNORECASE):
         return "Phase I"
-    if re.match(r'^Phase\s+II[-–]IV', normalized, re.IGNORECASE):
-        return "Phase II–IV"
+    if re.match(r'^Phase\s+II[-\u2013]IV', normalized, re.IGNORECASE):
+        return "Phase II\u2013IV"
     if re.match(r'^Phase\s+II(?:\s|$)', normalized, re.IGNORECASE):
         return "Phase II"
     if re.match(r'^Phase\s+III(?:\s|$)', normalized, re.IGNORECASE):
         return "Phase III"
     if re.match(r'^Phase\s+IV(?:\s|$)', normalized, re.IGNORECASE):
         return "Phase IV"
-    
-    # Also recognize "Uncategorized" as a phase (from Mode A output)
-    if text.lower() == "uncategorized":
+
+    if text.lower().strip() == "uncategorized":
         return "Uncategorized"
-    
+
     return None
 
 

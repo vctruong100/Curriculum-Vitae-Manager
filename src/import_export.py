@@ -121,12 +121,15 @@ class ImportExportManager:
                 if not studies:
                     return False, "No studies found in site", None
                 
-                # Determine output path - use result folder with site name + master study list
                 if output_path is None:
-                    result_path = Path(__file__).parent / "result"
-                    result_path.mkdir(parents=True, exist_ok=True)
-                    safe_name = "".join(c if c.isalnum() or c in '-_ ' else '_' for c in site.name)
-                    output_path = result_path / f"{safe_name} - Master Study List.xlsx"
+                    result_dir = Path(__file__).parent.parent / "result"
+                    safe_name = "".join(
+                        c if c.isalnum() or c in '-_ ' else '_'
+                        for c in site.name
+                    )
+                    site_folder = result_dir / safe_name
+                    site_folder.mkdir(parents=True, exist_ok=True)
+                    output_path = site_folder / f"{safe_name} - Master Study List.xlsx"
                 
                 # Get custom category order for this site
                 custom_order = db.get_category_order(site_id)

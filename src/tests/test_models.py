@@ -27,7 +27,7 @@ class TestStudy:
             description_full="desc full", description_masked="desc masked",
         )
         t = s.get_identity_tuple()
-        assert t == ("Phase I", "Oncology", 2024, "Pfizer", "PF-123", "desc masked")
+        assert t == ("Phase I", "oncology", 2024, "Pfizer", "PF-123", "desc masked")
 
     def test_identity_tuple_no_protocol(self):
         s = Study(

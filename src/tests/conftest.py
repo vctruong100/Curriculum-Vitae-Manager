@@ -201,6 +201,20 @@ def cv_no_research(tmp_dir):
 # Study helpers
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _cleanup_test_artifacts(tmp_path):
+    """Auto-cleanup: remove any test-generated files after each test."""
+    yield
+    for child in tmp_path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+
 @pytest.fixture
 def sample_studies():
     """Return a list of sample Study objects."""

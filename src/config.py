@@ -82,6 +82,9 @@ class AppConfig:
     # Log retention
     log_retention_days: int = 90
 
+    # Sorting behavior for Update/Inject mode
+    enable_sort_existing: bool = True
+
     # Offline guard (default ON)
     offline_guard_enabled: bool = True
 
@@ -109,6 +112,8 @@ class AppConfig:
             _errors.append(f"backup_retention_days must be int >= 1, got {self.backup_retention_days!r}")
         if not isinstance(self.log_retention_days, int) or self.log_retention_days < 1:
             _errors.append(f"log_retention_days must be int >= 1, got {self.log_retention_days!r}")
+        if not isinstance(self.enable_sort_existing, bool):
+            _errors.append(f"enable_sort_existing must be bool, got {self.enable_sort_existing!r}")
         if self.manual_benchmark_year is not None:
             if not isinstance(self.manual_benchmark_year, int) or not (1900 <= self.manual_benchmark_year <= 2100):
                 _errors.append(f"manual_benchmark_year must be int 1900-2100 or None, got {self.manual_benchmark_year!r}")
@@ -152,6 +157,10 @@ class AppConfig:
         """Get the logs directory for a user."""
         return self.get_user_data_path(user_id) / "logs"
     
+    def get_user_results_path(self, user_id: Optional[str] = None) -> Path:
+        """Get the results directory for a user."""
+        return self.get_user_data_path(user_id) / "results"
+    
     def get_temp_path(self) -> Path:
         """Get the temporary files directory."""
         return self.data_path / "tmp"
@@ -164,6 +173,7 @@ class AppConfig:
             self.get_user_imports_path(user_id),
             self.get_user_backups_path(user_id),
             self.get_user_logs_path(user_id),
+            self.get_user_results_path(user_id),
             self.get_temp_path(),
         ]
         for path in paths:

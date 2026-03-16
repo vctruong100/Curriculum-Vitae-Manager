@@ -4,6 +4,8 @@ Mode A: Update/Inject
 Mode B: Redact Protocols
 """
 
+import re
+import logging
 from pathlib import Path
 from typing import List, Optional, Tuple, Set
 from datetime import datetime
@@ -20,6 +22,11 @@ from database import DatabaseManager
 from logger import OperationLogger
 from config import get_config, AppConfig
 from error_handler import FilePermissionError
+
+# Regex to strip date-stamped result suffixes from CV filenames
+_RESULT_SUFFIX_RE = re.compile(
+    r'\s*\((?:Updated|Redacted)\s+\d{4}-\d{2}-\d{2}\)\s*$'
+)
 
 class CVProcessor:
     """Main processor for CV modification operations."""
@@ -75,6 +82,104 @@ class CVProcessor:
         except Exception:
             pass
     
+    @staticmethod
+    def _derive_original_cv_name(cv_path: Path) -> str:
+        """Derive the original CV base name.
+
+        Strategy:
+          1. Read the custom doc property ``_original_cv_name`` if present.
+          2. Otherwise strip date-stamped suffixes from the filename.
+
+        Handles filenames like:
+          "Jane Doe CV (Updated 2025-03-16).docx" -> "Jane Doe CV"
+          "Jane Doe CV (Redacted 2025-03-16).docx" -> "Jane Doe CV"
+          "Jane Doe CV (Updated 2025-03-16) (Redacted 2025-03-16).docx" -> "Jane Doe CV"
+          "Jane Doe CV.docx" -> "Jane Doe CV"
+        """
+        from_doc = CVProcessor._get_original_cv_name_from_doc(cv_path)
+        if from_doc:
+            logging.info(
+                "[Processor] Original CV name from doc property: '%s'",
+                from_doc,
+            )
+            return from_doc
+
+        stem = cv_path.stem
+        prev = None
+        while prev != stem:
+            prev = stem
+            stem = _RESULT_SUFFIX_RE.sub('', stem)
+        result = stem.strip()
+        logging.info(
+            "[Processor] Original CV name from suffix strip: '%s'",
+            result,
+        )
+        return result
+
+    _ORIGINAL_CV_MARKER = "_original_cv_name:"
+
+    def _resolve_output_path(
+        self,
+        cv_path: Path,
+        suffix_label: str = "Updated",
+        output_path: Optional[Path] = None,
+    ) -> Path:
+        """Resolve the output file path inside a per-CV result folder.
+
+        Structure:  <project_root>/result/<original_cv_name>/<file>.docx
+
+        If *output_path* is already set (user-specified), return it as-is.
+        """
+        if output_path is not None:
+            return output_path
+
+        original_name = self._derive_original_cv_name(cv_path)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        result_dir = Path(__file__).parent.parent / "result" / original_name
+        result_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{original_name} ({suffix_label} {date_str}){cv_path.suffix}"
+        resolved = result_dir / filename
+
+        logging.info(
+            "[Processor] Output routing: cv='%s' -> folder='%s', file='%s'",
+            cv_path.name,
+            result_dir,
+            filename,
+        )
+        return resolved
+
+    @staticmethod
+    def _set_original_cv_name(handler, original_name: str) -> None:
+        """Store the original CV base name in the document properties."""
+        try:
+            marker = CVProcessor._ORIGINAL_CV_MARKER
+            handler.document.core_properties.keywords = (
+                f"{marker}{original_name}"
+            )
+            logging.info(
+                "[Processor] Stored _original_cv_name='%s' in doc properties",
+                original_name,
+            )
+        except Exception as exc:
+            logging.warning(
+                "[Processor] Could not set _original_cv_name: %s", exc
+            )
+
+    @staticmethod
+    def _get_original_cv_name_from_doc(doc_path: Path) -> Optional[str]:
+        """Read the original CV base name from document properties."""
+        try:
+            from docx import Document as _Doc
+            doc = _Doc(doc_path)
+            kw = doc.core_properties.keywords or ""
+            marker = CVProcessor._ORIGINAL_CV_MARKER
+            if kw.startswith(marker):
+                return kw[len(marker):]
+        except Exception:
+            pass
+        return None
+
     def _build_identity_set(self, studies: List[Study]) -> Set[tuple]:
         """Build a set of identity tuples for deduplication."""
         identities = set()
@@ -90,6 +195,7 @@ class CVProcessor:
         site_id: Optional[int] = None,
         manual_benchmark_year: Optional[int] = None,
         output_path: Optional[Path] = None,
+        enable_sort_existing: Optional[bool] = None,
     ) -> OperationResult:
         """
         Mode A: Update/Inject
@@ -103,6 +209,19 @@ class CVProcessor:
         """
         logger = OperationLogger(config=self.config)
         logger.start_operation("Mode A - Update/Inject")
+        
+        # Resolve enable_sort_existing: parameter > config > default (True)
+        if enable_sort_existing is None:
+            enable_sort_existing = self.config.enable_sort_existing
+        logging.info(
+            "[Processor] enable_sort_existing=%s (config default=%s)",
+            enable_sort_existing,
+            self.config.enable_sort_existing,
+        )
+        logger.log(
+            "config",
+            details=f"enable_sort_existing={enable_sort_existing}",
+        )
         
         # Validate CV
         is_valid, error = validate_cv_docx(cv_path)
@@ -137,7 +256,6 @@ class CVProcessor:
             cv_studies = cv_research.get_all_studies()
             
             # Calculate year benchmark
-            import logging
             if manual_benchmark_year is not None:
                 # Manual benchmark takes priority - inject from this year onward
                 # year_bound is the year BEFORE the first year to inject
@@ -157,6 +275,9 @@ class CVProcessor:
             # Build new research experience structure from scratch
             new_research = ResearchExperience()
             matched_master_ids = set()  # Track which master studies have been matched
+            # Track object ids of studies that originate from the CV
+            # (vs newly injected from master) for preserve-order mode.
+            _existing_study_ids = []  # ordered list of (id(study_obj), study_obj)
             
             # Step 1: Match each CV study to master and reorganize
             for cv_study in cv_studies:
@@ -234,9 +355,25 @@ class CVProcessor:
                         )
                     
                     # Add to new structure
+                    from normalizer import normalize_heading_key, normalize_subcat_key
+                    phase_key = normalize_heading_key(updated_study.phase)
+                    subcat_key = normalize_subcat_key(updated_study.subcategory)
                     phase = new_research.get_or_create_phase(updated_study.phase)
                     subcategory = phase.get_or_create_subcategory(updated_study.subcategory)
                     subcategory.studies.append(updated_study)
+                    _existing_study_ids.append((id(updated_study), updated_study))
+                    
+                    logging.info(
+                        "[Processor] CV study matched -> phase='%s' "
+                        "(key='%s', node='%s'), subcat='%s' "
+                        "(key='%s', node='%s')",
+                        updated_study.phase,
+                        phase_key,
+                        phase.name,
+                        updated_study.subcategory,
+                        subcat_key,
+                        subcategory.name,
+                    )
                     
                     # Track matched master study
                     master_id = (matched_study.year, matched_study.sponsor, matched_study.protocol)
@@ -248,13 +385,15 @@ class CVProcessor:
                         updated_study.year,
                         updated_study.sponsor,
                         updated_study.protocol,
-                        f"Matched and categorized ({match_type}, score={score})"
+                        f"Matched and categorized ({match_type}, score={score}), "
+                        f"phase_key='{phase_key}', subcat_key='{subcat_key}'"
                     )
                 else:
                     # No match - keep original but in Uncategorized
                     phase = new_research.get_or_create_phase("Uncategorized")
                     subcategory = phase.get_or_create_subcategory("General")
                     subcategory.studies.append(cv_study)
+                    _existing_study_ids.append((id(cv_study), cv_study))
                     
                     logger.log_skipped_no_match(
                         cv_study.phase,
@@ -267,7 +406,6 @@ class CVProcessor:
             
             # Step 2: Inject master studies not in CV
             # Only inject studies AFTER the year bound (calculated earlier from CV studies)
-            import logging
             logging.info(f"[Processor] Year bound for injection: {year_bound}")
             studies_injected = 0
             for master_study in master_studies:
@@ -288,9 +426,26 @@ class CVProcessor:
                             continue
                     
                     # This master study is not in CV - inject it
+                    from normalizer import normalize_heading_key, normalize_subcat_key
+                    inj_phase_key = normalize_heading_key(master_study.phase)
+                    inj_subcat_key = normalize_subcat_key(master_study.subcategory)
                     phase = new_research.get_or_create_phase(master_study.phase)
                     subcategory = phase.get_or_create_subcategory(master_study.subcategory)
                     subcategory.studies.append(master_study)
+                    
+                    logging.info(
+                        "[Processor] Injecting '%s %s' -> phase='%s' "
+                        "(key='%s', node='%s'), subcat='%s' "
+                        "(key='%s', node='%s')",
+                        master_study.sponsor,
+                        master_study.protocol,
+                        master_study.phase,
+                        inj_phase_key,
+                        phase.name,
+                        master_study.subcategory,
+                        inj_subcat_key,
+                        subcategory.name,
+                    )
                     
                     logger.log_inserted(
                         master_study.phase,
@@ -298,7 +453,12 @@ class CVProcessor:
                         master_study.year,
                         master_study.sponsor,
                         master_study.protocol,
-                        f"Injected from master (not in CV){f', year > {year_bound}' if year_bound else ''}"
+                        f"Injected from master (not in CV)"
+                        f"{f', year > {year_bound}' if year_bound else ''}, "
+                        f"phase_key='{inj_phase_key}', "
+                        f"subcat_key='{inj_subcat_key}', "
+                        f"container_phase='{phase.name}', "
+                        f"container_subcat='{subcategory.name}'"
                     )
                     studies_injected += 1
             
@@ -310,7 +470,7 @@ class CVProcessor:
                 log_csv = logger.save_csv()
                 return logger.to_result(True, error_message="No studies to process")
             
-            # Sort the structure - apply custom order if available
+            # Sort the structure
             custom_order = None
             if site_id:
                 try:
@@ -319,31 +479,76 @@ class CVProcessor:
                 except:
                     pass
             
-            if custom_order:
-                new_research.sort_all_custom(custom_order)
+            if enable_sort_existing:
+                # --- Path A: Full sort (current behavior) ---
+                logging.info("[Processor] Sorting all studies (enable_sort_existing=True)")
+                if custom_order:
+                    new_research.sort_all_custom(custom_order)
+                else:
+                    new_research.sort_all()
+
+                # Write back to document (full rewrite)
+                handler.write_research_experience(
+                    new_research,
+                    include_protocol=True,
+                    protocol_red=True
+                )
             else:
-                new_research.sort_all()
-            
-            # Write back to document
-            handler.write_research_experience(
-                new_research,
-                include_protocol=True,
-                protocol_red=True
-            )
-            
-            # Save
+                # --- Path B: Preserve existing paragraphs completely ---
+                # Only inject new study paragraphs; do NOT rewrite existing
+                # content.  This preserves all original formatting, runs,
+                # indentation, tabs, spacing, and ordering.
+                logging.info(
+                    "[Processor] Preserving existing paragraphs "
+                    "(enable_sort_existing=False)"
+                )
+                existing_obj_ids = set(
+                    obj_id for obj_id, _ in _existing_study_ids
+                )
+
+                # Collect only new studies with their target phase/subcat
+                new_studies_for_injection = []
+                for phase in new_research.phases:
+                    for subcat in phase.subcategories:
+                        for study in subcat.studies:
+                            if id(study) not in existing_obj_ids:
+                                new_studies_for_injection.append(
+                                    (study, phase.name, subcat.name)
+                                )
+
+                logging.info(
+                    "[Processor] Preserve-existing path: %d new studies "
+                    "to inject into document",
+                    len(new_studies_for_injection),
+                )
+
+                inserted_count = handler.inject_new_studies_only(
+                    new_studies_for_injection,
+                    include_protocol=True,
+                    protocol_red=True,
+                )
+
+                logger.log(
+                    "splice-info",
+                    details=(
+                        f"Preserve-existing: injected {inserted_count} "
+                        f"paragraphs without rewriting existing content"
+                    ),
+                )
+
             if output_path is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
-                result_dir = Path(__file__).parent.parent / "result"
-                result_dir.mkdir(exist_ok=True)
-                output_path = result_dir / f"{cv_path.stem} (Updated {date_str}){cv_path.suffix}"
+                output_path = self._resolve_output_path(
+                    cv_path, suffix_label="Updated"
+                )
+
+            original_name = self._derive_original_cv_name(cv_path)
+            self._set_original_cv_name(handler, original_name)
             
             try:
                 handler.save(output_path)
             except PermissionError:
                 raise FilePermissionError(output_path, "save")
             
-            # Save logs
             log_json = logger.save_json()
             log_csv = logger.save_csv()
             
@@ -352,6 +557,162 @@ class CVProcessor:
         except Exception as e:
             return logger.to_result(False, error_message=f"Processing error: {str(e)}")
     
+    def _splice_new_studies_preserving_order(
+        self,
+        new_research: ResearchExperience,
+        existing_study_ids: list,
+        studies_injected: int,
+        year_bound,
+        custom_order,
+        logger: OperationLogger,
+    ) -> None:
+        """
+        Re-order studies within *new_research* so that pre-existing CV studies
+        keep their original relative order while newly injected studies are
+        sorted among themselves and spliced in as a contiguous block at the
+        correct insertion point per subcategory.
+
+        Args:
+            existing_study_ids: ordered list of (id(study_obj), study_obj)
+                collected during Step 1 (CV matching).  The list order
+                reflects the original CV paragraph order.
+
+        Insertion point logic (per subcategory):
+          1. Find the first existing study whose year >= year_bound.
+             Insert the new block immediately before that study.
+          2. If no existing study is at or above the year_bound, insert
+             the new block at the top of the subcategory.
+          3. If the subcategory has no existing studies at all, the new
+             block becomes the entire study list (already sorted).
+
+        Phase ordering still respects configured phase_order / custom_order.
+        Subcategories are sorted alphabetically (same as normal mode).
+        """
+        # Build a set of python object ids for studies from the original CV
+        existing_obj_ids = set(obj_id for obj_id, _ in existing_study_ids)
+
+        # Build an order-index map keyed by python object id
+        original_order = {}
+        for idx, (obj_id, _) in enumerate(existing_study_ids):
+            original_order[obj_id] = idx
+
+        # Sort phases (always sorted by configured order)
+        new_research.phases.sort(
+            key=lambda p: new_research.get_phase_order_key(p.name)
+        )
+
+        for phase in new_research.phases:
+            # Sort subcategories alphabetically
+            phase.subcategories.sort(key=lambda sc: sc.name.lower())
+
+            for subcat in phase.subcategories:
+                existing = []
+                newly_injected = []
+
+                for study in subcat.studies:
+                    if id(study) in existing_obj_ids:
+                        existing.append(study)
+                    else:
+                        newly_injected.append(study)
+
+                # Preserve original relative order for existing studies
+                existing.sort(
+                    key=lambda s: original_order.get(id(s), 999999)
+                )
+
+                # Sort new studies among themselves: year desc, sponsor, protocol
+                newly_injected.sort(
+                    key=lambda s: (
+                        -s.year,
+                        s.sponsor.lower(),
+                        s.protocol.lower(),
+                    )
+                )
+
+                existing_count = len(existing)
+                new_count = len(newly_injected)
+
+                if new_count == 0:
+                    # Nothing to splice — keep existing order as-is
+                    subcat.studies = existing
+                    logging.info(
+                        "[Processor] %s > %s: %d existing, 0 new — no splice needed",
+                        phase.name,
+                        subcat.name,
+                        existing_count,
+                    )
+                    continue
+
+                if existing_count == 0:
+                    # No existing studies — new block is the whole list
+                    subcat.studies = newly_injected
+                    logger.log(
+                        "splice-info",
+                        phase=phase.name,
+                        subcategory=subcat.name,
+                        details=(
+                            f"Subcategory empty; inserted {new_count} new "
+                            f"studies as entire list"
+                        ),
+                    )
+                    logging.info(
+                        "[Processor] %s > %s: 0 existing, %d new — "
+                        "inserted as entire list",
+                        phase.name,
+                        subcat.name,
+                        new_count,
+                    )
+                    continue
+
+                # Find insertion anchor: first existing study at/above year_bound
+                anchor_idx = None
+                anchor_reason = ""
+                for i, s in enumerate(existing):
+                    if year_bound is not None and s.year >= year_bound:
+                        anchor_idx = i
+                        anchor_reason = (
+                            f"first existing study at/above benchmark "
+                            f"year {year_bound} (year={s.year}, "
+                            f"sponsor={s.sponsor})"
+                        )
+                        break
+
+                if anchor_idx is None:
+                    # No existing study at/above benchmark — insert at top
+                    anchor_idx = 0
+                    anchor_reason = (
+                        f"no existing study at/above benchmark "
+                        f"year {year_bound}; inserting at top"
+                    )
+
+                # Splice: existing[:anchor] + new_block + existing[anchor:]
+                merged = (
+                    existing[:anchor_idx]
+                    + newly_injected
+                    + existing[anchor_idx:]
+                )
+                subcat.studies = merged
+
+                logger.log(
+                    "splice-info",
+                    phase=phase.name,
+                    subcategory=subcat.name,
+                    details=(
+                        f"existing={existing_count}, new={new_count}, "
+                        f"anchor_idx={anchor_idx}, reason={anchor_reason}"
+                    ),
+                )
+                logging.info(
+                    "[Processor] %s > %s: %d existing, %d new, "
+                    "anchor_idx=%d (%s)",
+                    phase.name,
+                    subcat.name,
+                    existing_count,
+                    new_count,
+                    anchor_idx,
+                    anchor_reason,
+                )
+
     def mode_b_redact_protocols(
         self,
         cv_path: Path,
@@ -478,19 +839,19 @@ class CVProcessor:
                 protocol_red=False
             )
             
-            # Save
             if output_path is None:
-                date_str = datetime.now().strftime("%Y-%m-%d")
-                result_dir = Path(__file__).parent.parent / "result"
-                result_dir.mkdir(exist_ok=True)
-                output_path = result_dir / f"{cv_path.stem} (Redacted {date_str}){cv_path.suffix}"  
+                output_path = self._resolve_output_path(
+                    cv_path, suffix_label="Redacted"
+                )
+
+            original_name = self._derive_original_cv_name(cv_path)
+            self._set_original_cv_name(handler, original_name)
             
             try:
                 handler.save(output_path)
             except PermissionError:
                 raise FilePermissionError(output_path, "save")
             
-            # Save logs
             log_json = logger.save_json()
             log_csv = logger.save_csv()
             
@@ -504,13 +865,20 @@ class CVProcessor:
         cv_path: Path,
         master_path: Optional[Path] = None,
         site_id: Optional[int] = None,
-        mode: str = "update_inject"
+        mode: str = "update_inject",
+        enable_sort_existing: Optional[bool] = None,
     ) -> Tuple[List[dict], str]:
         """
         Preview changes that would be made without applying them.
         
         Returns: (list of changes, error_message)
         """
+        if enable_sort_existing is None:
+            enable_sort_existing = self.config.enable_sort_existing
+        logging.info(
+            "[Processor] preview_changes: enable_sort_existing=%s",
+            enable_sort_existing,
+        )
         # Validate CV
         is_valid, error = validate_cv_docx(cv_path)
         if not is_valid:
@@ -553,15 +921,34 @@ class CVProcessor:
                     master_identity = master_study.get_identity_tuple(master_normalized)
                     
                     if master_identity not in existing_identities:
-                        changes.append({
+                        from normalizer import normalize_heading_key, normalize_subcat_key
+                        prev_phase_key = normalize_heading_key(master_study.phase)
+                        prev_subcat_key = normalize_subcat_key(master_study.subcategory)
+                        matched_phase_node = None
+                        matched_subcat_node = None
+                        for p in cv_research.phases:
+                            if normalize_heading_key(p.name) == prev_phase_key:
+                                matched_phase_node = p.name
+                                for sc in p.subcategories:
+                                    if normalize_subcat_key(sc.name) == prev_subcat_key:
+                                        matched_subcat_node = sc.name
+                                        break
+                                break
+                        change_entry = {
                             "action": "inject",
                             "phase": master_study.phase,
                             "subcategory": master_study.subcategory,
+                            "phase_key": prev_phase_key,
+                            "subcat_key": prev_subcat_key,
+                            "matched_phase_container": matched_phase_node,
+                            "matched_subcat_container": matched_subcat_node,
                             "year": master_study.year,
                             "sponsor": master_study.sponsor,
                             "protocol": master_study.protocol,
                             "description": master_study.description_full[:100] + "..." if len(master_study.description_full) > 100 else master_study.description_full,
-                        })
+                            "enable_sort_existing": enable_sort_existing,
+                        }
+                        changes.append(change_entry)
                         existing_identities.add(master_identity)
             
             elif mode == "redact_protocols":

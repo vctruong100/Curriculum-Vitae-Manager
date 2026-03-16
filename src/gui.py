@@ -28,8 +28,8 @@ class CVManagerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("CV Research Experience Manager (Offline)")
-        self.root.geometry("1000x700")
-        self.root.minsize(800, 600)
+        self.root.geometry("1000x900")
+        self.root.minsize(800, 900)
         
         # Configuration
         self.config = get_config()
@@ -237,6 +237,22 @@ class CVManagerApp:
             variable=self.update_preview_var
         ).pack(anchor=tk.W)
         
+        self.sort_existing_var = tk.BooleanVar(value=self.config.enable_sort_existing)
+        sort_cb = ttk.Checkbutton(
+            options_frame,
+            text="Enable sorting for existing studies",
+            variable=self.sort_existing_var
+        )
+        sort_cb.pack(anchor=tk.W, pady=(4, 0))
+        
+        sort_hint = ttk.Label(
+            options_frame,
+            text="If unchecked, only new studies are sorted; existing CV order is preserved.",
+            foreground='#666666',
+            font=('Segoe UI', 9, 'italic')
+        )
+        sort_hint.pack(anchor=tk.W, padx=(24, 0))
+        
         # Benchmark Configuration
         benchmark_outer = ttk.LabelFrame(options_frame, text="Year Benchmark", padding="8")
         benchmark_outer.pack(fill=tk.X, pady=(8, 0))
@@ -267,7 +283,7 @@ class CVManagerApp:
         
         help_label = ttk.Label(
             benchmark_frame, 
-            text="(inject from this year onward)",
+            text="(inject from this year onward. Uncheck 'Auto-detect from CV' to use)",
             foreground='#666666',
             font=('Segoe UI', 9, 'italic')
         )
@@ -613,7 +629,8 @@ class CVManagerApp:
                 Path(cv_path_str),
                 master_path,
                 site_id,
-                mode="update_inject"
+                mode="update_inject",
+                enable_sort_existing=self.sort_existing_var.get(),
             )
             
             if error:
@@ -677,7 +694,9 @@ class CVManagerApp:
                 Path(cv_path_str),
                 master_path,
                 site_id,
-                manual_benchmark
+                manual_benchmark,
+                None,
+                self.sort_existing_var.get(),
             )
             
             if result.success:
@@ -1331,14 +1350,14 @@ class StudyDialog(simpledialog.Dialog):
         
         # Description Full
         ttk.Label(master, text="Description (Full):").grid(row=5, column=0, sticky=tk.NW, pady=2)
-        self.desc_full_text = tk.Text(master, width=40, height=3)
+        self.desc_full_text = tk.Text(master, width=40, height=10)
         self.desc_full_text.grid(row=5, column=1, sticky=tk.EW, pady=2)
         if self.study:
             self.desc_full_text.insert(tk.END, self.study.description_full)
         
         # Description Masked
         ttk.Label(master, text="Description (Masked):").grid(row=6, column=0, sticky=tk.NW, pady=2)
-        self.desc_masked_text = tk.Text(master, width=40, height=3)
+        self.desc_masked_text = tk.Text(master, width=40, height=10)
         self.desc_masked_text.grid(row=6, column=1, sticky=tk.EW, pady=2)
         if self.study:
             self.desc_masked_text.insert(tk.END, self.study.description_masked)
@@ -1589,6 +1608,12 @@ class ConfigurationDialog(tk.Toplevel):
         self._labeled_check(c, "Use track changes", "use_track_changes")
         self._labeled_check(c, "Allow redaction without full match",
                             "allow_redaction_without_full_match")
+        self._labeled_check(
+            c,
+            "Enable sorting for existing studies",
+            "enable_sort_existing",
+            description="If unchecked, only new studies are sorted",
+        )
 
     def _section_retention(self):
         c = self._card("Retention Policy")
@@ -1635,6 +1660,7 @@ class ConfigurationDialog(tk.Toplevel):
         self._vars["log_retention_days"].set(cfg.log_retention_days)
         self._vars["phase_order"].set(", ".join(cfg.phase_order))
         self._vars["offline_guard_enabled"].set(cfg.offline_guard_enabled)
+        self._vars["enable_sort_existing"].set(cfg.enable_sort_existing)
 
     def _collect(self) -> dict:
         """Collect values from widgets into a config dict. Raises ValueError on bad input."""
@@ -1654,6 +1680,7 @@ class ConfigurationDialog(tk.Toplevel):
         d["highlight_inserted"] = self._vars["highlight_inserted"].get()
         d["use_track_changes"] = self._vars["use_track_changes"].get()
         d["allow_redaction_without_full_match"] = self._vars["allow_redaction_without_full_match"].get()
+        d["enable_sort_existing"] = self._vars["enable_sort_existing"].get()
         d["backup_retention_days"] = self._vars["backup_retention_days"].get()
         d["log_retention_days"] = self._vars["log_retention_days"].get()
         d["offline_guard_enabled"] = self._vars["offline_guard_enabled"].get()

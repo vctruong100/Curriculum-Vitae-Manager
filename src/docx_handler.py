@@ -15,9 +15,13 @@ from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
+import logging as _logging
+
 from models import Study, ResearchExperience, Phase, Subcategory, LogEntry
 from normalizer import (
     normalize_for_matching,
+    normalize_heading_key,
+    normalize_subcat_key,
     parse_study_line,
     is_phase_heading,
     is_year_line,
@@ -45,6 +49,12 @@ class CVDocxHandler:
         self.signature_paragraphs = []  # Store signature section paragraphs
         self.has_signature_section = False  # Track if signature section exists
         self.year_bound = None  # Year benchmark for injection (studies AFTER this year)
+        # Paragraph position tracking for preserve-existing write path
+        self._phase_heading_para = {}   # normalize_heading_key(name) -> para_idx
+        self._subcat_heading_para = {}  # (phase_key, subcat_key) -> para_idx
+        self._subcat_last_study_para = {}  # (phase_key, subcat_key) -> para_idx
+        self._subcat_study_para_list = {}  # (phase_key, subcat_key) -> [para_idx, ...]
+        self._phase_last_para = {}      # phase_key -> para_idx (last para in that phase)
         # Override class-level font defaults if config values provided
         if font_name:
             self.FONT_NAME = font_name
@@ -117,23 +127,42 @@ class CVDocxHandler:
         return start_idx, end_idx
     
     def _is_major_section_heading(self, para, text: str) -> bool:
-        """Check if paragraph is a major section heading."""
+        """Check if paragraph is a major section heading.
+
+        Detection is *text-based first*.  A paragraph with a Word heading
+        style (Heading 1, Heading 2, …) is treated as a section boundary
+        **only** when its text matches a known major-section name.  Phase
+        headings, subcategory headings, and other Research Experience
+        content that happens to use a heading style must NOT terminate the
+        Research Experience section.
+        """
         major_sections = [
             'education', 'publications', 'skills', 'certifications',
             'awards', 'honors', 'professional experience', 'work experience',
             'references', 'summary', 'objective', 'teaching', 'grants',
             'presentations', 'memberships', 'affiliations', 'licenses'
         ]
-        
-        # Check text matches a known section
+
+        # Text-based check — authoritative
         for section in major_sections:
             if text == section or text.startswith(section + ':'):
                 return True
-        
-        # Check if it has heading style
+
+        # Heading-styled paragraphs: only treat as boundary when the
+        # text matches a known section.  Phase headings ("Phase I") and
+        # subcategory headings ("Healthy Adults") styled with Word
+        # heading styles are NOT section boundaries.
         if para.style and 'heading' in para.style.name.lower():
-            return True
-        
+            # Already checked text against major_sections above.
+            # If it didn't match, this heading belongs to RE content.
+            _logging.debug(
+                "[CV Parse] Heading-styled para '%s' (style='%s') kept "
+                "inside Research Experience section",
+                text,
+                para.style.name,
+            )
+            return False
+
         return False
     
     def _is_signature_section(self, text: str) -> bool:
@@ -158,6 +187,49 @@ class CVDocxHandler:
         
         return False
     
+    def _infer_phase_from_context(
+        self,
+        research_exp: ResearchExperience,
+        current_para_idx: int,
+    ) -> Optional[Phase]:
+        """Scan upward from *current_para_idx* to find the nearest Phase heading.
+
+        Used when a subcategory heading is encountered without an active
+        Phase context (e.g. malformed documents).  If a Phase heading is
+        found, the corresponding Phase node from *research_exp* is returned
+        (creating it if necessary).  Returns ``None`` if no Phase heading
+        is found within the Research Experience section.
+        """
+        if self.research_exp_start_idx is None:
+            return None
+        for j in range(current_para_idx - 1, self.research_exp_start_idx, -1):
+            if j >= len(self.document.paragraphs):
+                continue
+            scan_text = self.document.paragraphs[j].text.strip()
+            if not scan_text:
+                continue
+            phase_name = is_phase_heading(scan_text)
+            if phase_name is not None:
+                _logging.info(
+                    "[CV Parse] Upward scan found phase '%s' at para %d",
+                    phase_name,
+                    j,
+                )
+                return research_exp.get_or_create_phase(phase_name)
+        return None
+
+    @staticmethod
+    def _merge_paragraph_text(para) -> str:
+        """Merge all runs in a paragraph into a single string.
+
+        This handles the case where Word splits a heading like
+        "PHASE I" across multiple runs (e.g. bold "PHASE " and
+        non-bold "I").  ``para.text`` already concatenates runs,
+        but we call it explicitly here for clarity and to allow
+        future pre-processing if needed.
+        """
+        return para.text
+
     def parse_research_experience(self) -> ResearchExperience:
         """
         Parse the Research Experience section into a structured format.
@@ -181,7 +253,7 @@ class CVDocxHandler:
         
         for i in range(start_idx + 1, end_idx + 1):
             para = self.document.paragraphs[i]
-            raw_text = para.text
+            raw_text = self._merge_paragraph_text(para)
             text = raw_text.strip()
             
             if not text:
@@ -267,9 +339,19 @@ class CVDocxHandler:
             # Check if this is a phase heading (Phase I, Phase II, etc.)
             phase_name = is_phase_heading(text)
             if phase_name:
-                current_phase = research_exp.get_or_create_phase(normalize_phase(phase_name))
+                current_phase = research_exp.get_or_create_phase(phase_name)
                 current_subcategory = None
                 current_sponsor_heading = None
+                p_key = normalize_heading_key(phase_name)
+                self._phase_heading_para[p_key] = i
+                self._phase_last_para[p_key] = i
+                _logging.info(
+                    "[CV Parse] Phase heading detected: raw='%s' "
+                    "canonical='%s' (para index=%d)",
+                    text,
+                    phase_name,
+                    i,
+                )
                 continue
             
             # Check if this is a study line (starts with 4-digit year)
@@ -296,6 +378,14 @@ class CVDocxHandler:
                         current_subcategory = current_phase.get_or_create_subcategory("General")
                     
                     current_subcategory.studies.append(study)
+                    p_key = normalize_heading_key(current_phase.name)
+                    s_key = normalize_subcat_key(current_subcategory.name)
+                    self._subcat_last_study_para[(p_key, s_key)] = i
+                    self._phase_last_para[p_key] = i
+                    subcat_tuple = (p_key, s_key)
+                    if subcat_tuple not in self._subcat_study_para_list:
+                        self._subcat_study_para_list[subcat_tuple] = []
+                    self._subcat_study_para_list[subcat_tuple].append(i)
                 continue
             
             # Check for sponsor headings (company names without year prefix)
@@ -309,12 +399,50 @@ class CVDocxHandler:
             is_role_label = any(text.startswith(role) for role in role_prefixes)
             
             if not text[:4].isdigit() and len(text.split()) <= 5 and not is_role_label:
-                # Could be a sponsor heading or subcategory
-                # Check if it looks like a company name
-                sponsor_keywords = ['INC', 'LLC', 'CORP', 'LTD', 'PHARMA', 'BIO', 'PLC', 'THERAPEUTICS', 'LABORATORIES', 'MEDICAL', 'VACCINES']
-                # Also treat short lines (1-3 words) as potential sponsors if they're title case or all caps
-                is_likely_sponsor = any(keyword in text.upper() for keyword in sponsor_keywords) or \
-                                    (len(text.split()) <= 3 and (text.isupper() or text.istitle()))
+                force_subcategory = (
+                    current_phase is not None
+                    and current_subcategory is None
+                )
+
+                next_is_year_line = False
+                for peek_idx in range(i + 1, end_idx + 1):
+                    peek_para = self.document.paragraphs[peek_idx]
+                    peek_text = self._merge_paragraph_text(peek_para).strip()
+                    if peek_text:
+                        next_is_year_line = is_year_line(peek_text)
+                        break
+
+                sponsor_keywords = [
+                    'INC', 'LLC', 'CORP', 'LTD', 'PHARMA', 'BIO',
+                    'PLC', 'THERAPEUTICS', 'LABORATORIES', 'MEDICAL',
+                ]
+                has_sponsor_keyword = any(
+                    keyword in text.upper()
+                    for keyword in sponsor_keywords
+                )
+                is_likely_sponsor = (
+                    not force_subcategory
+                    and not next_is_year_line
+                    and (
+                        has_sponsor_keyword
+                        or (
+                            len(text.split()) <= 3
+                            and (text.isupper() or text.istitle())
+                        )
+                    )
+                )
+
+                _logging.debug(
+                    "[CV Parse] Sponsor/subcat heuristic: text='%s' "
+                    "force_subcat=%s next_is_year=%s has_kw=%s "
+                    "-> is_sponsor=%s (para %d)",
+                    text,
+                    force_subcategory,
+                    next_is_year_line,
+                    has_sponsor_keyword,
+                    is_likely_sponsor,
+                    i,
+                )
                 
                 if is_likely_sponsor:
                     # Store the sponsor heading as-is (preserve original capitalization)
@@ -322,10 +450,51 @@ class CVDocxHandler:
                     continue
                 else:
                     # Might be a subcategory heading
-                    if current_phase:
-                        current_subcategory = current_phase.get_or_create_subcategory(normalize_for_display(text))
-                        # Reset sponsor heading when entering new subcategory
-                        current_sponsor_heading = None
+                    if current_phase is None:
+                        _logging.warning(
+                            "[CV Parse] Subcategory '%s' found without "
+                            "a governing Phase heading (para index=%d). "
+                            "Scanning upward for nearest Phase context.",
+                            text,
+                            i,
+                        )
+                        inferred_phase = self._infer_phase_from_context(
+                            research_exp, i,
+                        )
+                        if inferred_phase is not None:
+                            current_phase = inferred_phase
+                            _logging.info(
+                                "[CV Parse] Adopted orphan subcategory '%s' "
+                                "under inferred phase '%s'",
+                                text,
+                                current_phase.name,
+                            )
+                        else:
+                            current_phase = research_exp.get_or_create_phase(
+                                "Uncategorized"
+                            )
+                            _logging.info(
+                                "[CV Parse] No phase context found; placed "
+                                "subcategory '%s' under Uncategorized",
+                                text,
+                            )
+                    subcat_display = normalize_for_display(text)
+                    current_subcategory = current_phase.get_or_create_subcategory(
+                        subcat_display
+                    )
+                    p_key = normalize_heading_key(current_phase.name)
+                    s_key = normalize_subcat_key(subcat_display)
+                    self._subcat_heading_para[(p_key, s_key)] = i
+                    self._phase_last_para[p_key] = i
+                    _logging.info(
+                        "[CV Parse] Subcategory heading: raw='%s' "
+                        "display='%s' under phase='%s' (para index=%d)",
+                        text,
+                        subcat_display,
+                        current_phase.name,
+                        i,
+                    )
+                    current_sponsor_heading = None
                     continue
             
             # Skip signature/declaration sections
@@ -464,6 +633,225 @@ class CVDocxHandler:
         
         return para
     
+    def inject_new_studies_only(
+        self,
+        studies_to_inject: list,
+        include_protocol: bool = True,
+        protocol_red: bool = True,
+    ) -> int:
+        """Insert new study paragraphs using per-subcategory hybrid logic.
+
+        For subcategories that receive new studies:
+          - Existing study paragraph XML elements are MOVED (preserving
+            formatting, runs, etc.) into sorted order together with
+            newly created study elements.  The combined list is sorted
+            by year descending, then sponsor, then protocol.
+        For subcategories that receive NO new studies:
+          - Nothing is touched at all.
+        When the target subcategory or phase does not yet exist in the
+        document, the necessary heading paragraphs are created.
+
+        Args:
+            studies_to_inject: list of (Study, phase_display_name,
+                subcat_display_name)
+            include_protocol: include protocol in output
+            protocol_red: colour protocol red
+
+        Returns:
+            Number of paragraphs inserted (new elements only).
+        """
+        if not studies_to_inject:
+            _logging.info(
+                "[DocxHandler] inject_new_studies_only: nothing to inject"
+            )
+            return 0
+
+        groups = {}
+        for study, phase_name, subcat_name in studies_to_inject:
+            p_key = normalize_heading_key(phase_name)
+            s_key = normalize_subcat_key(subcat_name)
+            key = (p_key, s_key)
+            if key not in groups:
+                groups[key] = {
+                    "phase_name": phase_name,
+                    "subcat_name": subcat_name,
+                    "studies": [],
+                }
+            groups[key]["studies"].append(study)
+
+        body_elem = self.document.element.body
+        total_inserted = 0
+
+        sorted_keys = sorted(
+            groups.keys(),
+            key=lambda k: (k[0], k[1]),
+            reverse=True,
+        )
+
+        for (p_key, s_key) in sorted_keys:
+            group = groups[(p_key, s_key)]
+            phase_name = group["phase_name"]
+            subcat_name = group["subcat_name"]
+            new_studies = group["studies"]
+            subcat_tuple = (p_key, s_key)
+
+            need_phase_heading = False
+            need_subcat_heading = False
+
+            existing_para_indices = self._subcat_study_para_list.get(
+                subcat_tuple, []
+            )
+
+            if existing_para_indices:
+                anchor_idx = existing_para_indices[-1]
+            elif subcat_tuple in self._subcat_heading_para:
+                anchor_idx = self._subcat_heading_para[subcat_tuple]
+            elif p_key in self._phase_last_para:
+                anchor_idx = self._phase_last_para[p_key]
+                need_subcat_heading = True
+            elif self.research_exp_end_idx is not None:
+                anchor_idx = self.research_exp_end_idx
+                need_phase_heading = True
+                need_subcat_heading = True
+            else:
+                _logging.warning(
+                    "[DocxHandler] Cannot determine insertion point for "
+                    "phase='%s' subcat='%s'; skipping",
+                    phase_name,
+                    subcat_name,
+                )
+                continue
+
+            _logging.info(
+                "[DocxHandler] inject: phase='%s' subcat='%s' "
+                "existing_paras=%d new_studies=%d anchor=%d "
+                "need_phase=%s need_subcat=%s",
+                phase_name,
+                subcat_name,
+                len(existing_para_indices),
+                len(new_studies),
+                anchor_idx,
+                need_phase_heading,
+                need_subcat_heading,
+            )
+
+            if existing_para_indices:
+                existing_elems_with_year = []
+                for pidx in existing_para_indices:
+                    para = self.document.paragraphs[pidx]
+                    elem = para._element
+                    year_val = 0
+                    raw = self._merge_paragraph_text(para).strip()
+                    year_m = re.match(r'^(\d{4})', raw)
+                    if year_m:
+                        year_val = int(year_m.group(1))
+                    existing_elems_with_year.append(
+                        (elem, year_val, "", "", True)
+                    )
+
+                for elem, _, _, _, _ in existing_elems_with_year:
+                    parent = elem.getparent()
+                    if parent is not None:
+                        parent.remove(elem)
+
+                new_elems_with_year = []
+                for study in new_studies:
+                    use_red = (
+                        protocol_red
+                        and p_key != normalize_heading_key("Uncategorized")
+                    )
+                    elem = self._create_study_element(
+                        study, include_protocol, use_red
+                    )
+                    new_elems_with_year.append(
+                        (
+                            elem,
+                            study.year,
+                            study.sponsor.lower(),
+                            study.protocol.lower(),
+                            False,
+                        )
+                    )
+                    total_inserted += 1
+
+                combined = existing_elems_with_year + new_elems_with_year
+                combined.sort(
+                    key=lambda t: (-t[1], t[2], t[3])
+                )
+
+                subcat_heading_idx = self._subcat_heading_para.get(
+                    subcat_tuple
+                )
+                if subcat_heading_idx is not None:
+                    insert_after_elem = (
+                        self.document.paragraphs[subcat_heading_idx]._element
+                    )
+                else:
+                    if anchor_idx > 0:
+                        insert_after_elem = (
+                            self.document.paragraphs[
+                                existing_para_indices[0]
+                            ]._element.getprevious()
+                        )
+                        if insert_after_elem is None:
+                            insert_after_elem = (
+                                self.document.paragraphs[anchor_idx]._element
+                            )
+                    else:
+                        insert_after_elem = (
+                            self.document.paragraphs[anchor_idx]._element
+                        )
+
+                cursor = insert_after_elem
+                for elem, _, _, _, _ in combined:
+                    cursor.addnext(elem)
+                    cursor = elem
+
+            else:
+                anchor_elem = self.document.paragraphs[anchor_idx]._element
+                cursor = anchor_elem
+
+                if need_phase_heading:
+                    phase_elem = self._create_paragraph_element(
+                        phase_name, is_heading=True
+                    )
+                    cursor.addnext(phase_elem)
+                    cursor = phase_elem
+                    total_inserted += 1
+
+                if need_subcat_heading:
+                    subcat_elem = self._create_paragraph_element(
+                        subcat_name, is_heading=True
+                    )
+                    cursor.addnext(subcat_elem)
+                    cursor = subcat_elem
+                    total_inserted += 1
+
+                new_studies.sort(
+                    key=lambda s: (
+                        -s.year,
+                        s.sponsor.lower(),
+                        s.protocol.lower(),
+                    )
+                )
+                for study in new_studies:
+                    use_red = (
+                        protocol_red
+                        and p_key != normalize_heading_key("Uncategorized")
+                    )
+                    elem = self._create_study_element(
+                        study, include_protocol, use_red
+                    )
+                    cursor.addnext(elem)
+                    cursor = elem
+                    total_inserted += 1
+
+        _logging.info(
+            "[DocxHandler] inject_new_studies_only: inserted %d paragraphs",
+            total_inserted,
+        )
+        return total_inserted
+
     def write_research_experience(
         self,
         research_exp: ResearchExperience,

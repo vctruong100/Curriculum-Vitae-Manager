@@ -102,6 +102,9 @@ py src/main.py --mode redact --cv "my_cv.docx" --site 1 --preview
 # Update/Inject
 py src/main.py --mode update --cv "my_cv.docx" --master "studies.xlsx"
 
+# Update/Inject without re-sorting existing studies
+py src/main.py --mode update --cv "my_cv.docx" --master "studies.xlsx" --no-sort-existing
+
 # Redact protocols
 py src/main.py --mode redact --cv "my_cv.docx" --master "studies.xlsx"
 
@@ -119,6 +122,8 @@ py src/main.py --mode migrate
 ```
 
 The `--json` flag is available on `validate-master`, `validate-cv`, and `--preview` to produce structured JSON output suitable for automation.
+
+The `--sort-existing` / `--no-sort-existing` flags control whether existing CV studies are re-sorted during Update/Inject. By default (`--sort-existing`), all studies are sorted. With `--no-sort-existing`, only newly inserted studies are sorted among themselves; the relative order of pre-existing CV studies is preserved.
 
 ---
 
@@ -435,6 +440,7 @@ Edit `./data/config.json` to customize:
   "offline_guard_enabled": true,
   "backup_retention_days": 90,
   "log_retention_days": 90,
+  "enable_sort_existing": true,
   "data_root": "./data",
   "font_name": "Calibri",
   "font_size": 11
@@ -451,12 +457,51 @@ Edit `./data/config.json` to customize:
 | `offline_guard_enabled` | true | Block network sockets and scan for proxy env vars at startup |
 | `backup_retention_days` | 90 | Auto-delete backups older than this many days |
 | `log_retention_days` | 90 | Auto-delete log files older than this many days |
+| `enable_sort_existing` | true | When true, all studies are sorted during Update/Inject. When false, only new studies are sorted; existing CV order is preserved |
 | `font_name` | Calibri | Font family for output .docx. Allowed: Calibri, Times New Roman, Garamond, Helvetica, Roboto, Open Sans, Lato, Didot |
 | `font_size` | 11 | Font size in points (6–72) |
 
 Config is **validated on load** — invalid types or out-of-range values cause a fast failure with an actionable error message.
 
 All settings are also accessible via the **Configuration → Settings** menu in the GUI, which provides a professional settings panel with Save and Reset to Defaults buttons.
+
+The **"Enable sorting for existing studies"** option is also available as a checkbox in the Update/Inject tab's Options panel. When unchecked, only newly inserted studies are sorted; the relative order of pre-existing CV studies is preserved.
+
+### Robust Phase/Subcategory Matching
+
+Phase and Subcategory headings in the CV are matched to master data using **normalized keys only** — the original heading text in the document is never altered.
+
+Normalization for matching applies:
+- **Unicode NFC** normalization
+- **Casefold** (case-insensitive comparison)
+- **Whitespace collapse** (multiple spaces/tabs → single space, trimmed)
+- **Dash canonicalization** (en-dash, em-dash, and other Unicode dashes → hyphen)
+- **Quote canonicalization** (smart/curly quotes → straight quotes)
+- **Roman numeral equivalence** for phases via `PHASE_SYNONYMS` mapping (e.g. `"Phase 1"` ↔ `"Phase I"`, `"PHASE I"` ↔ `"Phase I"`, `"Phase II-IV"` ↔ `"Phase II–IV"`)
+
+This means a CV with `"PHASE I"` and a master with `"Phase I"` will correctly match to the **same** container — no duplicate Phase or Subcategory blocks are created. Existing headings and their formatting are preserved as-is; only the matching key is normalized.
+
+The `PHASE_SYNONYMS` constant in `normalizer.py` is authoritative for all recognized phase name variants.
+
+### Style-Agnostic Heading Detection
+
+Phase and Subcategory headings are detected **by text content**, regardless of the Word style applied (Normal, Heading 1, Heading 2, Heading 3, etc.). A heading-styled paragraph is treated as a section boundary **only** when its text matches a known major CV section name (e.g. "Education", "Publications"). Phase headings like "Phase I" and subcategory headings like "Healthy Adults" styled with Word heading styles are kept inside the Research Experience section.
+
+### Preserve-Existing Mode (Sort Disabled)
+
+When **"Enable sorting for existing studies"** is unchecked (or `--no-sort-existing` on the CLI), the program:
+- **Preserves all original XML formatting**: indentation, tabs, spacing, run boundaries, font styles, bold/color properties — existing paragraph elements are moved, never recreated
+- **Subcategories receiving new studies**: the combined list (existing + new) is sorted by year descending, sponsor, and protocol. Existing paragraph elements are reordered but their formatting is preserved
+- **Subcategories with no new studies**: completely untouched — no reordering, no reformatting
+- **Empty subcategories**: new studies are inserted immediately after the subcategory heading
+- Creates new Phase/Subcategory heading paragraphs only when the target container does not yet exist in the document
+- Maintains idempotency: subsequent runs detect already-inserted studies and do not add duplicates
+
+### Subcategory Detection
+
+Subcategory headings are distinguished from sponsor headings using a **look-ahead heuristic**: if the next non-empty paragraph after a short text line is a year-line (starts with a 4-digit year), the line is treated as a subcategory heading. This prevents subcategory names like "Healthy Adults" or "Vaccine" from being misclassified as sponsor company names. The look-ahead is combined with:
+- **Force-subcategory rule**: immediately after a phase heading, the first non-year, non-phase line is always a subcategory
+- **Sponsor keyword detection**: lines containing INC, LLC, CORP, PHARMA, etc. are treated as sponsor headings only when the next line is NOT a year-line
 
 ---
 
@@ -474,15 +519,30 @@ All settings are also accessible via the **Configuration → Settings** menu in 
 
 ## Output Files
 
-### Updated CV
-`{Original Name} (Updated YYYY-MM-DD).docx`
+All output files are written into a **per-CV result folder** at the project root:
 
-### Redacted CV
-`{Original Name} (Redacted YYYY-MM-DD).docx`
+```
+result/
+  <Original CV Name>/
+    <Original CV Name> (Updated YYYY-MM-DD).docx
+    <Original CV Name> (Redacted YYYY-MM-DD).docx
+    <Site Name> - Master Study List.xlsx     (Mode C export)
+```
+
+The result folder contains **only document files** (.docx, .xlsx). No JSON or CSV log files are placed in the result folder.
+
+The original CV name is determined by:
+1. Reading the custom document property `_original_cv_name` (set automatically by Mode A)
+2. Falling back to stripping date-stamped suffixes like `(Updated YYYY-MM-DD)` or `(Redacted YYYY-MM-DD)` from the input filename
+
+This means Mode B processing the output of Mode A writes into the **same** folder.
+
+If an explicit `--output` path is provided, that path is used as-is (no subfolder routing).
 
 ### Logs
 - JSON format: `{operation}_{timestamp}.json`
 - CSV format: `{operation}_{timestamp}.csv`
+- Logs are saved to the canonical logs directory only: `./data/users/{username}/logs/`
 
 Contains: operation type (inserted, replaced, skipped-duplicate, etc.), phase, subcategory, year, sponsor, protocol, match scores, and details.
 
