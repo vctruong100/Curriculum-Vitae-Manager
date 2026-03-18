@@ -3,6 +3,8 @@ Offline GUI for the CV Research Experience Manager.
 Built with tkinter - no network dependencies.
 """
 
+import sys
+import logging
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path
@@ -13,6 +15,7 @@ from datetime import datetime
 import re
 
 from config import get_config, set_config, AppConfig, get_os_username, get_app_root, ALLOWED_FONTS
+from tooltip_text import get_tooltip_text, TOOLTIP_MAX_WIDTH
 from models import Study, Site
 from database import DatabaseManager
 from processor import CVProcessor
@@ -51,6 +54,9 @@ class CVManagerApp:
         # Status bar
         self._create_status_bar()
         
+        # On-close handler: flush logs and exit cleanly
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         # Refresh sites list
         self._refresh_sites()
     
@@ -240,14 +246,14 @@ class CVManagerApp:
         self.sort_existing_var = tk.BooleanVar(value=self.config.enable_sort_existing)
         sort_cb = ttk.Checkbutton(
             options_frame,
-            text="Enable sorting for existing studies",
+            text="Enable sorting and formatting for existing studies",
             variable=self.sort_existing_var
         )
         sort_cb.pack(anchor=tk.W, pady=(4, 0))
         
         sort_hint = ttk.Label(
             options_frame,
-            text="If unchecked, only new studies are sorted; existing CV order is preserved.",
+            text="If unchecked, only new studies are sorted and formatted; existing CV order is preserved.",
             foreground='#666666',
             font=('Segoe UI', 9, 'italic')
         )
@@ -324,18 +330,41 @@ class CVManagerApp:
     
     def _create_redact_tab(self):
         """Create Mode B: Redact Protocols tab."""
-        # Description
         desc = ttk.Label(
             self.tab_redact,
             text="Remove protocols and mask treatment names from CV studies.\nMatches CV entries against master list and replaces with masked versions.",
             wraplength=900
         )
         desc.pack(anchor=tk.W, pady=(0, 10))
-        
-        # File selection
+
         self.redact_widgets = self._create_file_selection_frame(self.tab_redact)
-        
-        # Action buttons
+
+        options_frame = ttk.LabelFrame(
+            self.tab_redact, text="Options", padding="10"
+        )
+        options_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.redact_sort_format_var = tk.BooleanVar(value=False)
+        sort_cb = ttk.Checkbutton(
+            options_frame,
+            text="Sort and format studies",
+            variable=self.redact_sort_format_var,
+        )
+        sort_cb.pack(anchor=tk.W)
+
+        sort_hint = ttk.Label(
+            options_frame,
+            text=(
+                "If checked, redacted categories will be normalized and "
+                "re-sorted; if unchecked, studies are replaced in place "
+                "without changing order or formatting."
+            ),
+            foreground='#666666',
+            font=('Segoe UI', 9, 'italic'),
+            wraplength=850,
+        )
+        sort_hint.pack(anchor=tk.W, padx=(24, 0))
+
         btn_frame = ttk.Frame(self.tab_redact)
         btn_frame.pack(fill=tk.X, pady=10)
         
@@ -536,6 +565,17 @@ class CVManagerApp:
         self.status_var.set(message)
         self.root.update_idletasks()
     
+    def _on_close(self):
+        """Handle window close: flush logs, destroy window, exit process."""
+        logging.info("[GUI] Window closed by user — shutting down")
+        logging.shutdown()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        logging.info("[GUI] Process exiting with code 0")
+        sys.exit(0)
+
     # ==================== File Operations ====================
     
     def _browse_cv(self, entry: Optional[ttk.Entry] = None):
@@ -731,40 +771,72 @@ class CVManagerApp:
         if not cv_path_str:
             messagebox.showerror("Error", "Please select a CV file")
             return
-        
+
         master_path, site_id = self._get_source_from_widgets(self.redact_widgets)
         if not master_path and site_id is None:
             messagebox.showerror("Error", "Please select a master source (file or site)")
             return
-        
+
+        sort_and_format = self.redact_sort_format_var.get()
         self._set_status("Previewing redactions...")
         self.redact_results.delete(1.0, tk.END)
-        
+
         try:
             processor = CVProcessor(self.config)
             changes, error = processor.preview_changes(
                 Path(cv_path_str),
                 master_path,
                 site_id,
-                mode="redact_protocols"
+                mode="redact_protocols",
+                sort_and_format=sort_and_format,
             )
-            
+
             if error:
                 self.redact_results.insert(tk.END, f"Error: {error}\n")
             elif not changes:
-                self.redact_results.insert(tk.END, "No studies matched for redaction.\n")
+                self.redact_results.insert(tk.END, "No studies found for redaction.\n")
             else:
-                self.redact_results.insert(tk.END, f"Found {len(changes)} studies to redact:\n\n")
-                for change in changes:
+                redact_changes = [
+                    c for c in changes if c["action"] == "redact"
+                ]
+                skip_changes = [
+                    c for c in changes if c["action"] != "redact"
+                ]
+                self.redact_results.insert(
+                    tk.END,
+                    f"Sort and format: {'ON' if sort_and_format else 'OFF'}\n"
+                    f"Studies to redact: {len(redact_changes)}\n"
+                    f"Studies skipped: {len(skip_changes)}\n\n",
+                )
+                for change in redact_changes:
+                    resort_tag = ""
+                    if change.get("would_resort_category"):
+                        resort_tag = " [category will be re-sorted]"
                     self.redact_results.insert(
                         tk.END,
-                        f"• {change['year']} | {change['sponsor']} {change['protocol']}\n"
-                        f"  Match score: {change['match_score']}%\n"
-                        f"  New text: {change['new_description']}\n\n"
+                        f"• {change['year']} | {change['sponsor']} "
+                        f"{change['protocol']}\n"
+                        f"  Anchor: para {change.get('anchor_para_idx', '?')}"
+                        f"{resort_tag}\n"
+                        f"  Match: {change.get('match_type', '?')} "
+                        f"(score={change.get('match_score', '?')}%)\n"
+                        f"  New: {change.get('new_sponsor', '')} : "
+                        f"{change.get('new_description', '')}\n\n",
                     )
-            
+                if skip_changes:
+                    self.redact_results.insert(
+                        tk.END, "--- Skipped studies ---\n"
+                    )
+                    for change in skip_changes:
+                        self.redact_results.insert(
+                            tk.END,
+                            f"  {change['action']}: {change['year']} | "
+                            f"{change['sponsor']} — "
+                            f"{change.get('reason', '')}\n",
+                        )
+
             self._set_status("Preview complete")
-            
+
         except Exception as e:
             self.redact_results.insert(tk.END, f"Error: {str(e)}\n")
             self._set_status("Preview failed")
@@ -775,16 +847,16 @@ class CVManagerApp:
         if not cv_path_str:
             messagebox.showerror("Error", "Please select a CV file")
             return
-        
+
         master_path, site_id = self._get_source_from_widgets(self.redact_widgets)
         if not master_path and site_id is None:
             messagebox.showerror("Error", "Please select a master source (file or site)")
             return
-        
+
+        sort_and_format = self.redact_sort_format_var.get()
         self.redact_results.delete(1.0, tk.END)
-        
+
         try:
-            # Run with progress dialog
             processor = CVProcessor(self.config)
             result = run_with_progress(
                 self.root,
@@ -793,7 +865,9 @@ class CVManagerApp:
                 processor.mode_b_redact_protocols,
                 Path(cv_path_str),
                 master_path,
-                site_id
+                site_id,
+                None,
+                sort_and_format,
             )
             
             if result.success:
@@ -1397,6 +1471,128 @@ class StudyDialog(simpledialog.Dialog):
         }
 
 
+class ConfigToolTip:
+
+    _SHOW_DELAY_MS = 400
+    _HIDE_DELAY_MS = 200
+    _BG = "#333333"
+    _FG = "#ffffff"
+    _FONT = ("Segoe UI", 9)
+    _PADX = 8
+    _PADY = 6
+
+    def __init__(self, parent, text, max_width=TOOLTIP_MAX_WIDTH):
+        self._parent = parent
+        self._text = text
+        self._max_width = max_width
+        self._tip_window = None
+        self._show_id = None
+        self._hide_id = None
+
+        self._icon = tk.Label(
+            parent,
+            text="\u24d8",
+            font=("Segoe UI", 9),
+            fg="#666666",
+            bg=parent.cget("bg"),
+            cursor="hand2",
+        )
+        self._icon.pack(side=tk.LEFT, padx=(4, 0))
+
+        self._icon.bind("<Enter>", self._schedule_show)
+        self._icon.bind("<Leave>", self._schedule_hide)
+        self._icon.bind("<FocusIn>", self._schedule_show)
+        self._icon.bind("<FocusOut>", self._schedule_hide)
+        self._icon.bind("<Escape>", self._hide_now)
+        self._icon.bind("<Button-1>", self._toggle)
+
+        self._icon.configure(takefocus=True)
+
+    @property
+    def icon_widget(self):
+        return self._icon
+
+    def _schedule_show(self, event=None):
+        self._cancel_hide()
+        if self._tip_window is not None:
+            return
+        self._show_id = self._parent.after(self._SHOW_DELAY_MS, self._show)
+
+    def _schedule_hide(self, event=None):
+        self._cancel_show()
+        if self._tip_window is None:
+            return
+        self._hide_id = self._parent.after(self._HIDE_DELAY_MS, self._hide_now)
+
+    def _cancel_show(self, event=None):
+        if self._show_id is not None:
+            self._parent.after_cancel(self._show_id)
+            self._show_id = None
+
+    def _cancel_hide(self, event=None):
+        if self._hide_id is not None:
+            self._parent.after_cancel(self._hide_id)
+            self._hide_id = None
+
+    def _toggle(self, event=None):
+        if self._tip_window is not None:
+            self._hide_now()
+        else:
+            self._cancel_show()
+            self._show()
+
+    def _show(self):
+        self._show_id = None
+        if self._tip_window is not None:
+            return
+        x = self._icon.winfo_rootx() + self._icon.winfo_width() + 4
+        y = self._icon.winfo_rooty()
+
+        self._tip_window = tw = tk.Toplevel(self._parent)
+        tw.wm_overrideredirect(True)
+        tw.configure(bg=self._BG)
+
+        lbl = tk.Label(
+            tw,
+            text=self._text,
+            justify=tk.LEFT,
+            wraplength=self._max_width,
+            bg=self._BG,
+            fg=self._FG,
+            font=self._FONT,
+            padx=self._PADX,
+            pady=self._PADY,
+        )
+        lbl.pack()
+
+        tw.update_idletasks()
+        tw_width = tw.winfo_width()
+        tw_height = tw.winfo_height()
+        screen_width = tw.winfo_screenwidth()
+        screen_height = tw.winfo_screenheight()
+
+        if x + tw_width > screen_width:
+            x = self._icon.winfo_rootx() - tw_width - 4
+        if y + tw_height > screen_height:
+            y = screen_height - tw_height - 4
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+
+        tw.wm_geometry(f"+{x}+{y}")
+
+        tw.bind("<Enter>", self._cancel_hide)
+        tw.bind("<Leave>", self._schedule_hide)
+
+    def _hide_now(self, event=None):
+        self._cancel_show()
+        self._cancel_hide()
+        if self._tip_window is not None:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+
 class ConfigurationDialog(tk.Toplevel):
     """Professional configuration dialog with all application settings."""
 
@@ -1465,8 +1661,8 @@ class ConfigurationDialog(tk.Toplevel):
         self._section_font()
         self._section_formatting()
         self._section_retention()
-        self._section_phase_order()
-        self._section_security()
+        # self._section_phase_order()
+        # self._section_security()
 
         # Footer buttons
         footer = tk.Frame(self, bg=self._SECTION_BG)
@@ -1525,6 +1721,7 @@ class ConfigurationDialog(tk.Toplevel):
         if description:
             tk.Label(row, text=description, font=("Segoe UI", 9, "italic"),
                      fg="#888888", bg=self._CARD_BG).pack(side=tk.LEFT, padx=(8, 0))
+        ConfigToolTip(row, get_tooltip_text(key))
         self._vars[key] = var
 
     def _labeled_entry(self, parent, label: str, key: str,
@@ -1540,6 +1737,7 @@ class ConfigurationDialog(tk.Toplevel):
         if description:
             tk.Label(row, text=description, font=("Segoe UI", 9, "italic"),
                      fg="#888888", bg=self._CARD_BG).pack(side=tk.LEFT, padx=(8, 0))
+        ConfigToolTip(row, get_tooltip_text(key))
         self._vars[key] = var
 
     def _labeled_check(self, parent, label: str, key: str,
@@ -1554,6 +1752,7 @@ class ConfigurationDialog(tk.Toplevel):
         if description:
             tk.Label(row, text=description, font=("Segoe UI", 9, "italic"),
                      fg="#888888", bg=self._CARD_BG).pack(side=tk.LEFT, padx=(8, 0))
+        ConfigToolTip(row, get_tooltip_text(key))
         self._vars[key] = var
 
     def _labeled_combo(self, parent, label: str, key: str,
@@ -1570,6 +1769,7 @@ class ConfigurationDialog(tk.Toplevel):
         if description:
             tk.Label(row, text=description, font=("Segoe UI", 9, "italic"),
                      fg="#888888", bg=self._CARD_BG).pack(side=tk.LEFT, padx=(8, 0))
+        ConfigToolTip(row, get_tooltip_text(key))
         self._vars[key] = var
 
     # ---- sections ----
@@ -1584,9 +1784,9 @@ class ConfigurationDialog(tk.Toplevel):
         c = self._card("Benchmark Calculation")
         self._labeled_spinbox(c, "Minimum study count (step-back):", "benchmark_min_count",
                               1, 100, description="≤ this → step back 1 year")
-        self._labeled_check(c, "Auto-find benchmark year", "auto_find_benchmark")
-        self._labeled_entry(c, "Manual benchmark year:", "manual_benchmark_year",
-                            width=8, description="Leave blank for auto")
+        # self._labeled_check(c, "Auto-find benchmark year", "auto_find_benchmark")
+        # self._labeled_entry(c, "Manual benchmark year:", "manual_benchmark_year",
+                            # width=8, description="Leave blank for auto")
 
     def _section_year_inference(self):
         c = self._card("Year Inference Thresholds")
@@ -1604,15 +1804,23 @@ class ConfigurationDialog(tk.Toplevel):
 
     def _section_formatting(self):
         c = self._card("Formatting Options")
-        self._labeled_check(c, "Highlight inserted studies", "highlight_inserted")
-        self._labeled_check(c, "Use track changes", "use_track_changes")
-        self._labeled_check(c, "Allow redaction without full match",
-                            "allow_redaction_without_full_match")
-        self._labeled_check(
+        self._labeled_check(c, "Highlight inserted studies", "highlight_inserted",
+                            description="Newly injected studies are highlighted in yellow")
+        # self._labeled_check(c, "Use track changes", "use_track_changes")
+        # self._labeled_check(c, "Allow redaction without full match",
+        #                     "allow_redaction_without_full_match")
+        # self._labeled_check(
+        #     c,
+        #     "Enable sorting and formatting for existing studies",
+        #     "enable_sort_existing",
+        #     description="If unchecked, only new studies are sorted and formatted",
+        # )
+        self._labeled_entry(
             c,
-            "Enable sorting for existing studies",
-            "enable_sort_existing",
-            description="If unchecked, only new studies are sorted",
+            "Uncategorized label:",
+            "uncategorized_label",
+            width=24,
+            description='Label for studies without a category match',
         )
 
     def _section_retention(self):
@@ -1645,22 +1853,23 @@ class ConfigurationDialog(tk.Toplevel):
         self._vars["fuzzy_threshold_full"].set(cfg.fuzzy_threshold_full)
         self._vars["fuzzy_threshold_masked"].set(cfg.fuzzy_threshold_masked)
         self._vars["benchmark_min_count"].set(cfg.benchmark_min_count)
-        self._vars["auto_find_benchmark"].set(cfg.auto_find_benchmark)
-        self._vars["manual_benchmark_year"].set(
-            str(cfg.manual_benchmark_year) if cfg.manual_benchmark_year is not None else ""
-        )
+        # self._vars["auto_find_benchmark"].set(cfg.auto_find_benchmark)
+        # self._vars["manual_benchmark_year"].set(
+        #     str(cfg.manual_benchmark_year) if cfg.manual_benchmark_year is not None else ""
+        # )
         self._vars["year_inference_full_threshold"].set(cfg.year_inference_full_threshold)
         self._vars["year_inference_masked_threshold"].set(cfg.year_inference_masked_threshold)
         self._vars["font_name"].set(cfg.font_name)
         self._vars["font_size"].set(cfg.font_size)
         self._vars["highlight_inserted"].set(cfg.highlight_inserted)
-        self._vars["use_track_changes"].set(cfg.use_track_changes)
-        self._vars["allow_redaction_without_full_match"].set(cfg.allow_redaction_without_full_match)
+        # self._vars["use_track_changes"].set(cfg.use_track_changes)
+        # self._vars["allow_redaction_without_full_match"].set(cfg.allow_redaction_without_full_match)
         self._vars["backup_retention_days"].set(cfg.backup_retention_days)
         self._vars["log_retention_days"].set(cfg.log_retention_days)
-        self._vars["phase_order"].set(", ".join(cfg.phase_order))
-        self._vars["offline_guard_enabled"].set(cfg.offline_guard_enabled)
-        self._vars["enable_sort_existing"].set(cfg.enable_sort_existing)
+        # self._vars["phase_order"].set(", ".join(cfg.phase_order))
+        # self._vars["offline_guard_enabled"].set(cfg.offline_guard_enabled)
+        # self._vars["enable_sort_existing"].set(cfg.enable_sort_existing)
+        self._vars["uncategorized_label"].set(cfg.uncategorized_label)
 
     def _collect(self) -> dict:
         """Collect values from widgets into a config dict. Raises ValueError on bad input."""
@@ -1668,25 +1877,26 @@ class ConfigurationDialog(tk.Toplevel):
         d["fuzzy_threshold_full"] = self._vars["fuzzy_threshold_full"].get()
         d["fuzzy_threshold_masked"] = self._vars["fuzzy_threshold_masked"].get()
         d["benchmark_min_count"] = self._vars["benchmark_min_count"].get()
-        d["auto_find_benchmark"] = self._vars["auto_find_benchmark"].get()
+        # d["auto_find_benchmark"] = self._vars["auto_find_benchmark"].get()
 
-        mbr = self._vars["manual_benchmark_year"].get().strip()
-        d["manual_benchmark_year"] = int(mbr) if mbr else None
+        # mbr = self._vars["manual_benchmark_year"].get().strip()
+        # d["manual_benchmark_year"] = int(mbr) if mbr else None
 
         d["year_inference_full_threshold"] = self._vars["year_inference_full_threshold"].get()
         d["year_inference_masked_threshold"] = self._vars["year_inference_masked_threshold"].get()
         d["font_name"] = self._vars["font_name"].get().strip()
         d["font_size"] = self._vars["font_size"].get()
         d["highlight_inserted"] = self._vars["highlight_inserted"].get()
-        d["use_track_changes"] = self._vars["use_track_changes"].get()
-        d["allow_redaction_without_full_match"] = self._vars["allow_redaction_without_full_match"].get()
-        d["enable_sort_existing"] = self._vars["enable_sort_existing"].get()
+        # d["use_track_changes"] = self._vars["use_track_changes"].get()
+        # d["allow_redaction_without_full_match"] = self._vars["allow_redaction_without_full_match"].get()
+        # d["enable_sort_existing"] = self._vars["enable_sort_existing"].get()
+        d["uncategorized_label"] = self._vars["uncategorized_label"].get().strip() or "Uncategorized"
         d["backup_retention_days"] = self._vars["backup_retention_days"].get()
         d["log_retention_days"] = self._vars["log_retention_days"].get()
-        d["offline_guard_enabled"] = self._vars["offline_guard_enabled"].get()
+        # d["offline_guard_enabled"] = self._vars["offline_guard_enabled"].get()
 
-        raw_phases = self._vars["phase_order"].get()
-        d["phase_order"] = [p.strip() for p in raw_phases.split(",") if p.strip()]
+        # raw_phases = self._vars["phase_order"].get()
+        # d["phase_order"] = [p.strip() for p in raw_phases.split(",") if p.strip()]
 
         d["data_root"] = self._config.data_root
         d["network_enabled"] = False
@@ -2018,9 +2228,13 @@ class ReadmeViewer(tk.Toplevel):
 
 def main():
     """Main entry point."""
+    logging.info("[GUI] Starting GUI application")
     root = tk.Tk()
     app = CVManagerApp(root)
     root.mainloop()
+    logging.info("[GUI] mainloop exited — flushing logs")
+    logging.shutdown()
+    sys.exit(0)
 
 
 if __name__ == "__main__":

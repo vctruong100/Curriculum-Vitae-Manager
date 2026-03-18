@@ -9,11 +9,23 @@ from typing import List, Optional, Tuple
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
 
+import logging
+
 from models import Study, ResearchExperience, Phase, Subcategory
 from normalizer import (
     normalize_phase, normalize_for_display, extract_protocol,
     parse_sponsor_protocol, is_phase_heading, validate_year
 )
+
+SEVEN_COL_HEADERS = [
+    "Phase",
+    "Subcategory",
+    "Year",
+    "Sponsor",
+    "Protocol",
+    "Masked Description",
+    "Full Description",
+]
 
 
 def parse_master_xlsx(file_path: Path) -> List[Study]:
@@ -218,6 +230,172 @@ def export_studies_to_xlsx(
     
     wb.save(output_path)
     wb.close()
+
+
+def detect_xlsx_format(file_path: Path) -> str:
+    """Detect whether an .xlsx file uses the 7-column or legacy 3-column format.
+
+    Returns:
+        '7col' if the first row matches SEVEN_COL_HEADERS exactly.
+        '3col' if the file appears to use the legacy hierarchy format.
+        'unknown' otherwise.
+    """
+    try:
+        wb = load_workbook(file_path, read_only=True, data_only=True)
+        ws = wb.active
+        first_row = []
+        for row in ws.iter_rows(min_row=1, max_row=1, values_only=True):
+            first_row = [str(c).strip() if c is not None else "" for c in row]
+            break
+        wb.close()
+        if len(first_row) >= 7:
+            if first_row[:7] == SEVEN_COL_HEADERS:
+                return "7col"
+        return "3col"
+    except Exception:
+        return "unknown"
+
+
+def parse_master_xlsx_seven_col(file_path: Path) -> List[Study]:
+    """Parse a 7-column .xlsx file into a list of Study objects.
+
+    Expected columns (row 1 header):
+        Phase | Subcategory | Year | Sponsor | Protocol | Masked Description | Full Description
+
+    Year must be an integer or numeric-convertible value.
+    Returns a list of Study objects.
+    Raises ValueError on invalid headers or data.
+    """
+    wb = load_workbook(file_path, read_only=True, data_only=True)
+    ws = wb.active
+
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    wb.close()
+
+    if not rows:
+        raise ValueError("File is empty")
+
+    header = [str(c).strip() if c is not None else "" for c in rows[0]]
+    if len(header) < 7:
+        raise ValueError(
+            f"Expected 7 columns ({', '.join(SEVEN_COL_HEADERS)}), "
+            f"got {len(header)}. If using legacy 3-column format, "
+            f"please re-export with the 7-column schema."
+        )
+    for idx, expected in enumerate(SEVEN_COL_HEADERS):
+        if header[idx] != expected:
+            raise ValueError(
+                f"Column {idx + 1} header must be '{expected}', "
+                f"got '{header[idx]}'. Expected headers: {SEVEN_COL_HEADERS}"
+            )
+
+    studies = []
+    for row_num, row in enumerate(rows[1:], start=2):
+        if not row or all(c is None for c in row):
+            continue
+        cells = list(row) + [None] * max(0, 7 - len(row))
+
+        phase = str(cells[0]).strip() if cells[0] else ""
+        subcategory = str(cells[1]).strip() if cells[1] else ""
+        year_raw = cells[2]
+        sponsor = str(cells[3]).strip() if cells[3] else ""
+        protocol = str(cells[4]).strip() if cells[4] else ""
+        desc_masked = str(cells[5]).strip() if cells[5] else ""
+        desc_full = str(cells[6]).strip() if cells[6] else ""
+
+        if not phase and not sponsor:
+            continue
+
+        try:
+            year_val = int(float(str(year_raw))) if year_raw is not None else 0
+        except (ValueError, TypeError):
+            raise ValueError(
+                f"Row {row_num}: Year must be numeric, got {year_raw!r}"
+            )
+        if year_val != 0 and not (1900 <= year_val <= 2100):
+            raise ValueError(
+                f"Row {row_num}: Year must be 1900-2100 or 0, got {year_val}"
+            )
+
+        phase = normalize_phase(phase)
+
+        study = Study(
+            phase=phase,
+            subcategory=subcategory,
+            year=year_val,
+            sponsor=sponsor,
+            protocol=protocol,
+            description_full=desc_full,
+            description_masked=desc_masked,
+        )
+        studies.append(study)
+
+    logging.info(
+        "[ExcelParser] Parsed %d studies from 7-column file '%s'",
+        len(studies),
+        file_path.name,
+    )
+    return studies
+
+
+def export_studies_to_xlsx_seven_col(
+    studies: List[Study],
+    output_path: Path,
+    custom_order: Optional[List[str]] = None,
+) -> None:
+    """Export studies to a 7-column .xlsx file.
+
+    Columns: Phase | Subcategory | Year | Sponsor | Protocol | Masked Description | Full Description
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Studies"
+
+    for col_idx, header in enumerate(SEVEN_COL_HEADERS, start=1):
+        ws.cell(row=1, column=col_idx, value=header)
+
+    if custom_order:
+        order_lookup = {key: idx for idx, key in enumerate(custom_order)}
+        default_order = len(custom_order)
+        sorted_studies = sorted(studies, key=lambda s: (
+            order_lookup.get(f"{s.phase} > {s.subcategory}", default_order),
+            -s.year,
+            s.sponsor.lower(),
+            s.protocol.lower(),
+        ))
+    else:
+        sorted_studies = sorted(studies, key=lambda s: (
+            0 if "phase i" in s.phase.lower() and "ii" not in s.phase.lower() else 1,
+            s.subcategory.lower(),
+            -s.year,
+            s.sponsor.lower(),
+            s.protocol.lower(),
+        ))
+
+    for row_idx, study in enumerate(sorted_studies, start=2):
+        ws.cell(row=row_idx, column=1, value=study.phase)
+        ws.cell(row=row_idx, column=2, value=study.subcategory)
+        ws.cell(row=row_idx, column=3, value=study.year)
+        ws.cell(row=row_idx, column=4, value=study.sponsor)
+        ws.cell(row=row_idx, column=5, value=study.protocol)
+        ws.cell(row=row_idx, column=6, value=study.description_masked)
+        ws.cell(row=row_idx, column=7, value=study.description_full)
+
+    ws.column_dimensions['A'].width = 15
+    ws.column_dimensions['B'].width = 20
+    ws.column_dimensions['C'].width = 8
+    ws.column_dimensions['D'].width = 20
+    ws.column_dimensions['E'].width = 15
+    ws.column_dimensions['F'].width = 60
+    ws.column_dimensions['G'].width = 60
+
+    wb.save(output_path)
+    wb.close()
+    logging.info(
+        "[ExcelParser] Exported %d studies to 7-column file '%s'",
+        len(sorted_studies),
+        output_path.name,
+    )
 
 
 def validate_master_xlsx(file_path: Path) -> Tuple[bool, str]:

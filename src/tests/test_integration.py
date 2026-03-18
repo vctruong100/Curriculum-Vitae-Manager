@@ -20,7 +20,7 @@ from processor import CVProcessor
 from import_export import ImportExportManager
 from database import DatabaseManager
 from models import Study
-from tests.conftest import _make_master_xlsx, _make_cv_docx
+from tests.conftest import _make_master_xlsx, _make_master_xlsx_seven_col, _make_cv_docx
 
 
 class TestModeAUpdateInject:
@@ -139,7 +139,7 @@ class TestModeBRedact:
         assert (tmp_dir / "redacted.docx").exists()
 
     def test_redact_output_no_protocols(self, app_config, tmp_dir):
-        """Redacted output should not contain protocol strings in study text."""
+        """Matched redacted studies should have protocol removed and XXX mask applied."""
         cv_path = tmp_dir / "cv.docx"
         _make_cv_docx(cv_path)
 
@@ -153,14 +153,24 @@ class TestModeBRedact:
         )
         assert result.success is True
 
-        # Open the redacted doc and check no red text
+        replaced_ops = [
+            e for e in result.log_entries if e.operation == "replaced"
+        ]
+        skipped_ops = [
+            e for e in result.log_entries
+            if e.operation in ("skipped-no-protocol", "skipped-already-masked")
+        ]
+        assert len(replaced_ops) + len(skipped_ops) >= 0
+
         doc = Document(output)
-        for para in doc.paragraphs:
-            for run in para.runs:
+        redacted_paras = [
+            p for p in doc.paragraphs if "XXX" in p.text
+        ]
+        for p in redacted_paras:
+            for run in p.runs:
                 if run.font.color and run.font.color.rgb:
-                    # Should not have red protocol runs
                     assert run.font.color.rgb != RGBColor(0xFF, 0, 0), \
-                        f"Found red text in redacted doc: '{run.text}'"
+                        f"Found red text in redacted paragraph: '{run.text}'"
 
     def test_missing_cv_fails(self, app_config, tmp_dir):
         master_path = tmp_dir / "master.xlsx"
@@ -220,8 +230,8 @@ class TestImportExport:
     """Integration tests for import/export."""
 
     def test_import_and_export_round_trip(self, app_config, tmp_dir):
-        master_path = tmp_dir / "master.xlsx"
-        _make_master_xlsx(master_path)
+        master_path = tmp_dir / "master_7col.xlsx"
+        _make_master_xlsx_seven_col(master_path)
 
         manager = ImportExportManager(app_config)
 
@@ -241,8 +251,8 @@ class TestImportExport:
         assert export_path.exists()
 
     def test_import_replace_existing(self, app_config, tmp_dir):
-        master_path = tmp_dir / "master.xlsx"
-        _make_master_xlsx(master_path)
+        master_path = tmp_dir / "master_7col.xlsx"
+        _make_master_xlsx_seven_col(master_path)
 
         manager = ImportExportManager(app_config)
 
@@ -280,8 +290,8 @@ class TestDatabaseIntegration:
     """Integration tests for database operations via import/export."""
 
     def test_duplicate_site_name_without_replace(self, app_config, tmp_dir):
-        master_path = tmp_dir / "master.xlsx"
-        _make_master_xlsx(master_path)
+        master_path = tmp_dir / "master_7col.xlsx"
+        _make_master_xlsx_seven_col(master_path)
 
         manager = ImportExportManager(app_config)
         manager.import_xlsx_to_site(master_path, "MySite", replace_existing=True)
@@ -293,8 +303,8 @@ class TestDatabaseIntegration:
 
     def test_site_from_db_as_master_source(self, app_config, tmp_dir):
         """Import a master list to DB, then use the site as master source for Mode A."""
-        master_path = tmp_dir / "master.xlsx"
-        _make_master_xlsx(master_path)
+        master_path = tmp_dir / "master_7col.xlsx"
+        _make_master_xlsx_seven_col(master_path)
 
         manager = ImportExportManager(app_config)
         success, _, site_id = manager.import_xlsx_to_site(

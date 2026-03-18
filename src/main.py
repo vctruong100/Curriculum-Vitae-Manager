@@ -95,10 +95,11 @@ Examples:
   # Redact mode with saved site
   python main.py --mode redact --cv "my_cv.docx" --site 1
   
-  # Import xlsx to database
+  # Import 7-column xlsx to database
+  # Columns: Phase, Subcategory, Year, Sponsor, Protocol, Masked Description, Full Description
   python main.py --mode import --master "studies.xlsx" --site-name "My Site"
   
-  # Export site to xlsx
+  # Export site to 7-column xlsx
   python main.py --mode export --site 1 --output "exported.xlsx"
   
   # List all sites

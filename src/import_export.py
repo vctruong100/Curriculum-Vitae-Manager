@@ -8,9 +8,15 @@ from datetime import datetime
 from typing import List, Tuple, Optional
 import shutil
 
+import logging
+
 from models import Study, Site
 from database import DatabaseManager
-from excel_parser import parse_master_xlsx, export_studies_to_xlsx, validate_master_xlsx
+from excel_parser import (
+    parse_master_xlsx, export_studies_to_xlsx, validate_master_xlsx,
+    detect_xlsx_format, parse_master_xlsx_seven_col,
+    export_studies_to_xlsx_seven_col, SEVEN_COL_HEADERS,
+)
 from logger import OperationLogger
 from config import get_config, AppConfig
 
@@ -41,14 +47,28 @@ class ImportExportManager:
         """
         user_id = user_id or self.config.get_user_id()
         
-        # Validate the xlsx file
-        is_valid, error = validate_master_xlsx(xlsx_path)
-        if not is_valid:
-            return False, f"Invalid file: {error}", None
-        
         try:
-            # Parse the xlsx file
-            studies = parse_master_xlsx(xlsx_path)
+            # Detect format and parse accordingly
+            fmt = detect_xlsx_format(xlsx_path)
+            logging.info(
+                "[ImportExport] Detected format '%s' for '%s'",
+                fmt,
+                xlsx_path.name,
+            )
+            if fmt == "7col":
+                studies = parse_master_xlsx_seven_col(xlsx_path)
+            elif fmt == "3col":
+                return False, (
+                    "This file uses the legacy 3-column format. "
+                    "Please re-export it using the new 7-column schema "
+                    f"({', '.join(SEVEN_COL_HEADERS)}) and try again."
+                ), None
+            else:
+                # Validate and try legacy parser as fallback
+                is_valid, error = validate_master_xlsx(xlsx_path)
+                if not is_valid:
+                    return False, f"Invalid file: {error}", None
+                studies = parse_master_xlsx(xlsx_path)
             
             if not studies:
                 return False, "No studies found in the file", None
@@ -122,21 +142,29 @@ class ImportExportManager:
                     return False, "No studies found in site", None
                 
                 if output_path is None:
-                    result_dir = Path(__file__).parent.parent / "result"
+                    # Export to project root/result/ folder
+                    results_dir = self.config.get_result_root()
                     safe_name = "".join(
                         c if c.isalnum() or c in '-_ ' else '_'
                         for c in site.name
                     )
-                    site_folder = result_dir / safe_name
+                    site_folder = results_dir / safe_name
                     site_folder.mkdir(parents=True, exist_ok=True)
                     output_path = site_folder / f"{safe_name} - Master Study List.xlsx"
                 
                 # Get custom category order for this site
                 custom_order = db.get_category_order(site_id)
                 
-                # Export
+                # Export using 7-column format
+                logging.info(
+                    "[ImportExport] Exporting %d studies to '%s' (7-col)",
+                    len(studies),
+                    output_path,
+                )
                 try:
-                    export_studies_to_xlsx(studies, output_path, custom_order=custom_order)
+                    export_studies_to_xlsx_seven_col(
+                        studies, output_path, custom_order=custom_order,
+                    )
                 except PermissionError:
                     from error_handler import FilePermissionError
                     raise FilePermissionError(output_path, "save")

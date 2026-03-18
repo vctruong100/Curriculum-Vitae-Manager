@@ -13,14 +13,13 @@ An **offline-only** desktop application for managing the Research Experience sec
 - [File Formats](#file-formats)
 - [Data Storage](#data-storage)
 - [Configuration](#configuration)
-- [Security & Privacy](#security--privacy)
 - [Output Files](#output-files)
 - [Formatting Rules](#formatting-rules)
 - [Normalization](#normalization)
 - [Testing](#testing)
 - [Packaging](#packaging)
 - [Error Handling](#error-handling)
-- [License](#license)
+- [Support](#support)
 
 ---
 
@@ -58,7 +57,7 @@ An **offline-only** desktop application for managing the Research Experience sec
 
 ```bash
 # Clone or download this repository
-cd "Curriculum Vitae"
+cd "Curriculum Vitae Manager"
 
 # Install dependencies
 pip install -r requirements.txt
@@ -108,10 +107,11 @@ py src/main.py --mode update --cv "my_cv.docx" --master "studies.xlsx" --no-sort
 # Redact protocols
 py src/main.py --mode redact --cv "my_cv.docx" --master "studies.xlsx"
 
-# Import master to DB
+# Import 7-column xlsx to DB
+# Columns: Phase, Subcategory, Year, Sponsor, Protocol, Masked Description, Full Description
 py src/main.py --mode import --master "studies.xlsx" --site-name "My Site"
 
-# Export site
+# Export site to 7-column xlsx
 py src/main.py --mode export --site 1 --output "exported.xlsx"
 
 # List sites
@@ -136,7 +136,6 @@ When you run `main.py`, the following happens in order:
 1. **Dependency check** — verifies `python-docx`, `openpyxl`, and `rapidfuzz` are installed.
 2. **Writability check** — confirms the `./data/` directory is writable.
 3. **Config load** — loads `./data/config.json` (or creates defaults). Config is validated with type checks; invalid values fail fast with actionable messages.
-4. **Offline guard** — if `offline_guard_enabled` is `true` (the default), scans for proxy environment variables, checks for disallowed network modules, and monkeypatches `socket.connect` to block all outbound connections.
 5. **Permissions enforcement** — sets owner-only permissions on the user's data directory (`./data/users/{username}/`).
 6. **Backup pruning** — removes backup files older than `backup_retention_days` (default: 90).
 7. **Dispatch** — if command-line arguments are present, runs the CLI handler; otherwise, launches the tkinter GUI.
@@ -148,7 +147,7 @@ User selects CV (.docx) + Master source (.xlsx or DB site)
         │
         ▼
   ┌─────────────┐     ┌──────────────┐
-   │ docx_handler│     │ excel_parser │  ← or database.py if using a site
+  │ docx_handler│     │ excel_parser │  ← or database.py if using a site
   │  parse CV   │     │ parse master │
   └──────┬──────┘     └──────┬───────┘
          │                   │
@@ -196,25 +195,30 @@ User selects CV (.docx) + Master source
   │  1. Parse CV → ResearchExp      │
   │  2. Parse master → Study list   │
   │  3. For each CV study:          │
-  │     - match_study_to_master     │
-  │     - If matched: replace with  │
-  │       masked description        │
-  │     - Protocol removed          │
-  │     - Treatments → XXX          │
-  │  4. Sort and rewrite            │
+  │     a. Skip if already masked   │
+  │     b. Skip if no protocol token│
+  │     c. match_study_to_master    │
+  │     d. If matched: replace para │
+  │        runs with masked content │
+  │  4. (Optional) Re-sort affected │
+  │     subcategories only          │
   └──────┬──────────────────────────┘
          │
          ▼
   ┌─────────────┐     ┌──────────┐
   │ docx_handler│     │ logger   │
-  │ write output│     │ JSON/CSV │
+  │ save in     │     │ JSON/CSV │
+  │ place       │     │ (logs/)  │
   └─────────────┘     └──────────┘
 ```
 
 **Key decisions**:
-- Every CV study is compared against the master list using `normalizer.match_study_to_master()`, which tries exact matching first, then falls back to fuzzy matching with configurable thresholds.
-- Matched studies have their full description replaced with the masked version from Column C of the master list.
-- Unmatched studies are preserved as-is but logged for review.
+- **Replace-only by default**: Mode B redacts only studies that contain a protocol token (detected via normalized text, not font colour). Non-protocol studies and already-masked studies are never touched. Paragraph positions, headings, and surrounding structure are preserved.
+- **Protocol detection**: Uses `contains_protocol_token()` — NFC normalization, casefold, whitespace collapse, dash canonicalization, then `extract_protocol()` with a sponsor-prefix cross-check. Does not rely on red font or bold styling.
+- **Idempotency**: Already-masked lines (containing XXX and no protocol token) are detected by `is_already_masked()` and skipped. A second run produces no changes.
+- **GUI option — "Sort and format studies"**: A checkbox in the Mode B panel (default unchecked). When **unchecked**, studies are replaced in place without changing order or formatting. When **checked**, subcategories that received at least one replacement are re-sorted (year desc → sponsor → protocol) after redaction. Subcategories with no replacements are untouched. No categories are moved between phases.
+- **Preview**: `--preview` mode lists anchor paragraph indices and the resolved masked text for each planned replacement, indicates which categories would be re-sorted, and does not modify documents.
+- **Logging**: Operations logged as `replaced`, `skipped-no-protocol`, `skipped-already-masked`, and `sort-category`. The `sort_and_format` flag state is recorded in the `config` log entry. Logs are written to the canonical logs directory only — no JSON/CSV in the result folder.
 
 ### Mode C: Database Management Flow
 
@@ -317,7 +321,7 @@ Curriculum Vitae/
               ┌────────────────┼─────────────────┐
               │                │                 │
               ▼                ▼                 ▼
-       ┌──────────┐   ┌─────────────┐   ┌──────────────┐
+        ┌──────────┐   ┌─────────────┐   ┌──────────────┐
         │  gui.py  │   │ CLI handler │   │ config.py    │
         │ (tkinter)│   │ (in main)   │   │ (settings)   │
         └────┬─────┘   └──────┬──────┘   └──────────────┘
@@ -388,19 +392,21 @@ Curriculum Vitae/
 - Studies formatted as: `{Year}<TAB>{Sponsor} {Protocol}: {Description}`
 - Hierarchy: Phase heading → Subcategory heading → Study entries
 
-### Master List (.xlsx)
-| Column A | Column B | Column C |
-|----------|----------|----------|
-| Phase I | | |
-| Oncology | | |
-| 2024 | Pfizer PF-123: Full description with treatment | Pfizer: Masked description with XXX |
-| 2023 | Novartis NVS-456: Another study | Novartis: Masked version |
-| Phase II–IV | | |
-| ... | ... | ... |
+### Master List (.xlsx) — 7-Column Format
 
-- **Column A**: Hierarchy stream (Phase row → Subcategory row → Year for studies)
-- **Column B**: Full description with protocol and treatment names
-- **Column C**: Masked description (no protocol, treatments replaced with XXX)
+The current import/export schema uses **7 explicit columns** with a mandatory header row:
+
+| Phase | Subcategory | Year | Sponsor | Protocol | Masked Description | Full Description |
+|-------|-------------|------|---------|----------|--------------------|------------------|
+| Phase I | Oncology | 2024 | Pfizer | PF-123 | Pfizer: A study of XXX in lung cancer | Pfizer PF-123: A study of PF-123 (pembro) in lung cancer |
+| Phase I | Cardiology | 2023 | Novartis | NVS-456 | Novartis: Another study with XXX | Novartis NVS-456: Another study with NVS-456 |
+| Phase II–IV | Oncology | 2024 | Roche | RO-777 | Roche: Phase 3 XXX vs placebo | Roche RO-777: Phase 3 atezolizumab vs placebo |
+
+- **Row 1 must be the header**: `Phase, Subcategory, Year, Sponsor, Protocol, Masked Description, Full Description`
+- **Year**: Integer (1900–2100) or 0 for unknown
+- **Legacy 3-column format**: No longer accepted for import. Export to 7-column first
+
+> **Migration note**: If you have legacy 3-column `.xlsx` files, open them in the GUI (Mode C → Export), which will re-export in the 7-column format. Then re-import the new file.
 
 ---
 
@@ -434,13 +440,9 @@ Edit `./data/config.json` to customize:
   "fuzzy_threshold_masked": 90,
   "benchmark_min_count": 4,
   "highlight_inserted": false,
-  "use_track_changes": false,
-  "phase_order": ["Phase I", "Phase II–IV"],
-  "network_enabled": false,
-  "offline_guard_enabled": true,
   "backup_retention_days": 90,
   "log_retention_days": 90,
-  "enable_sort_existing": true,
+  "uncategorized_label": "Uncategorized",
   "data_root": "./data",
   "font_name": "Calibri",
   "font_size": 11
@@ -453,17 +455,26 @@ Edit `./data/config.json` to customize:
 | `fuzzy_threshold_full` | 92 | Minimum match score for full descriptions |
 | `fuzzy_threshold_masked` | 90 | Minimum match score for masked descriptions |
 | `benchmark_min_count` | 4 | If ≤3 studies in latest year, benchmark = latest - 1 |
-| `network_enabled` | false | **Always false** — app is offline-only |
-| `offline_guard_enabled` | true | Block network sockets and scan for proxy env vars at startup |
 | `backup_retention_days` | 90 | Auto-delete backups older than this many days |
 | `log_retention_days` | 90 | Auto-delete log files older than this many days |
-| `enable_sort_existing` | true | When true, all studies are sorted during Update/Inject. When false, only new studies are sorted; existing CV order is preserved |
+| `highlight_inserted` | false | When true, newly injected studies are highlighted in yellow in the output .docx |
+| `uncategorized_label` | Uncategorized | Display label for studies that don't match any master category. Must be non-empty |
 | `font_name` | Calibri | Font family for output .docx. Allowed: Calibri, Times New Roman, Garamond, Helvetica, Roboto, Open Sans, Lato, Didot |
 | `font_size` | 11 | Font size in points (6–72) |
 
 Config is **validated on load** — invalid types or out-of-range values cause a fast failure with an actionable error message.
 
-All settings are also accessible via the **Configuration → Settings** menu in the GUI, which provides a professional settings panel with Save and Reset to Defaults buttons.
+All settings are also accessible via the **Configuration → Settings** menu in the GUI, which provides a professional settings panel with Save and Reset to Defaults buttons. Each setting has a **tooltip icon** (ⓘ) that explains what the setting does and how changing it affects the program. Tooltips appear on hover, focus, or click, and are keyboard-accessible.
+
+### Automatic Category Order Maintenance
+
+When a new Phase or Subcategory is added to the database — via Mode C CRUD, Import, or Mode A processing — the **Category Order** is automatically updated to include the new entry at the end. This ensures that:
+
+- Newly created categories appear immediately in Mode A and Mode B sorting without requiring a restart or manual save.
+- Existing order is preserved; only genuinely new entries are appended.
+- The operation is idempotent: adding the same category again does not create duplicates or shift existing indexes.
+- If `phase_order` is configured in `config.json`, it remains authoritative for Phase-level sorting; the database order governs subcategory ordering within each phase.
+- Deletion of a study does not remove its category from the order table, preserving historical ordering.
 
 The **"Enable sorting for existing studies"** option is also available as a checkbox in the Update/Inject tab's Options panel. When unchecked, only newly inserted studies are sorted; the relative order of pre-existing CV studies is preserved.
 
@@ -502,18 +513,6 @@ When **"Enable sorting for existing studies"** is unchecked (or `--no-sort-exist
 Subcategory headings are distinguished from sponsor headings using a **look-ahead heuristic**: if the next non-empty paragraph after a short text line is a year-line (starts with a 4-digit year), the line is treated as a subcategory heading. This prevents subcategory names like "Healthy Adults" or "Vaccine" from being misclassified as sponsor company names. The look-ahead is combined with:
 - **Force-subcategory rule**: immediately after a phase heading, the first non-year, non-phase line is always a subcategory
 - **Sponsor keyword detection**: lines containing INC, LLC, CORP, PHARMA, etc. are treated as sponsor headings only when the next line is NOT a year-line
-
----
-
-## Security & Privacy
-
-- **Offline-only**: Zero network requests. `offline_guard.py` monkeypatches `socket.connect` at startup to guarantee no connections can be made
-- **Per-user isolation**: Each OS user has their own private database and directories
-- **Local storage**: All files stored in local `./data/` directory
-- **Restrictive permissions**: User folders set to owner-read/write only (chmod 700 on Unix; icacls guidance logged on Windows)
-- **No telemetry**: No analytics, update checks, or external communication
-- **Log sanitization**: In Redact mode, protocol-like tokens are replaced with `[REDACTED]` in all log output
-- **Proxy detection**: Startup warns if `HTTP_PROXY`, `HTTPS_PROXY`, or similar env vars are set
 
 ---
 
@@ -585,7 +584,7 @@ Text is normalized for matching (via `normalizer.py`):
 
 ## Testing
 
-The project includes a comprehensive test suite with 200 tests:
+The project includes a comprehensive test suite with 460 tests:
 
 ```bash
 # Run all tests
@@ -647,10 +646,11 @@ This is an offline, local application. For issues:
 2. Verify file formats match the specifications above
 3. Ensure write permissions to the data directory
 4. Run `py src/main.py --mode validate-master --master "file.xlsx"` to check your master list
-5. Run `py src/main.py --mode validate-cv --cv "file.docx"` to check your CV
-port
+5. Run `py src/main.py --mode validate-cv --cv "file.docx"` to check your CV port
 
 This is an offline, local application. For issues:
 1. Check the logs in `./data/users/{username}/logs/`
 2. Verify file formats match specifications above
 3. Ensure write permissions to data directory
+
+Please let me know if there is any bug/issue or any feature request.

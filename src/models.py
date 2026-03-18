@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import datetime
 
-from normalizer import normalize_heading_key, normalize_subcat_key
+from normalizer import normalize_heading_key, normalize_subcat_key, is_uncategorized_key
 
 
 @dataclass
@@ -126,7 +126,7 @@ class ResearchExperience:
     def get_phase_order_key(self, phase_name: str) -> int:
         """Get sort key for phase ordering (Phase I first, then Phase II-IV, Uncategorized last)."""
         key = normalize_heading_key(phase_name)
-        if key == "Uncategorized":
+        if is_uncategorized_key(phase_name):
             return 99
         if key == "Phase I":
             return 0

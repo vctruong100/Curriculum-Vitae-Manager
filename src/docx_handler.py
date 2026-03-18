@@ -12,8 +12,11 @@ from copy import deepcopy
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+from docx.enum.text import WD_COLOR_INDEX
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
+
+HIGHLIGHT_COLOR_YELLOW = WD_COLOR_INDEX.YELLOW
 
 import logging as _logging
 
@@ -22,6 +25,7 @@ from normalizer import (
     normalize_for_matching,
     normalize_heading_key,
     normalize_subcat_key,
+    is_uncategorized_key,
     parse_study_line,
     is_phase_heading,
     is_year_line,
@@ -29,6 +33,8 @@ from normalizer import (
     normalize_for_display,
     strip_role_label,
     parse_sponsor_protocol,
+    contains_protocol_token,
+    is_already_masked,
 )
 
 
@@ -552,7 +558,8 @@ class CVDocxHandler:
         self,
         study: Study,
         include_protocol: bool = True,
-        protocol_red: bool = True
+        protocol_red: bool = True,
+        highlight: bool = False,
     ):
         """
         Create a formatted paragraph for a study entry.
@@ -582,16 +589,18 @@ class CVDocxHandler:
         self._set_font_eastasia(run_year)
         
         # Tab
-        para.add_run('\t')
+        run_tab = para.add_run('\t')
         
-        # Sponsor (bold)
+        # Sponsor (bold) — highlighted when highlight=True
         run_sponsor = para.add_run(study.sponsor)
         run_sponsor.font.name = self.FONT_NAME
         run_sponsor.font.size = self.FONT_SIZE
         run_sponsor.font.bold = True
+        if highlight:
+            run_sponsor.font.highlight_color = HIGHLIGHT_COLOR_YELLOW
         self._set_font_eastasia(run_sponsor)
         
-        # Protocol (bold + red, if present and included)
+        # Protocol (bold + red, if present and included) — highlighted when highlight=True
         if include_protocol and study.protocol:
             run_space = para.add_run(' ')
             run_space.font.name = self.FONT_NAME
@@ -603,6 +612,8 @@ class CVDocxHandler:
             run_protocol.font.bold = True
             if protocol_red:
                 run_protocol.font.color.rgb = self.PROTOCOL_COLOR
+            if highlight:
+                run_protocol.font.highlight_color = HIGHLIGHT_COLOR_YELLOW
             self._set_font_eastasia(run_protocol)
         
         # Colon and description
@@ -638,6 +649,7 @@ class CVDocxHandler:
         studies_to_inject: list,
         include_protocol: bool = True,
         protocol_red: bool = True,
+        highlight_inserted: bool = False,
     ) -> int:
         """Insert new study paragraphs using per-subcategory hybrid logic.
 
@@ -682,18 +694,14 @@ class CVDocxHandler:
         body_elem = self.document.element.body
         total_inserted = 0
 
-        sorted_keys = sorted(
-            groups.keys(),
-            key=lambda k: (k[0], k[1]),
-            reverse=True,
-        )
-
-        for (p_key, s_key) in sorted_keys:
-            group = groups[(p_key, s_key)]
+        # --- Phase 1: pre-compute anchor element references while
+        #     paragraph indices are still valid (before any mutation). ---
+        injection_plan = []
+        for (p_key, s_key), group in groups.items():
+            subcat_tuple = (p_key, s_key)
             phase_name = group["phase_name"]
             subcat_name = group["subcat_name"]
             new_studies = group["studies"]
-            subcat_tuple = (p_key, s_key)
 
             need_phase_heading = False
             need_subcat_heading = False
@@ -722,6 +730,42 @@ class CVDocxHandler:
                 )
                 continue
 
+            # Resolve element references NOW (indices are still valid)
+            anchor_elem = self.document.paragraphs[anchor_idx]._element
+
+            # Pre-resolve existing paragraph elements and year data
+            existing_elems_with_year = []
+            subcat_heading_elem = None
+            first_existing_prev_elem = None
+
+            if existing_para_indices:
+                for pidx in existing_para_indices:
+                    para = self.document.paragraphs[pidx]
+                    elem = para._element
+                    year_val = 0
+                    raw = self._merge_paragraph_text(para).strip()
+                    year_m = re.match(r'^(\d{4})', raw)
+                    if year_m:
+                        year_val = int(year_m.group(1))
+                    existing_elems_with_year.append(
+                        (elem, year_val, "", "", True)
+                    )
+
+                sh_idx = self._subcat_heading_para.get(subcat_tuple)
+                if sh_idx is not None:
+                    subcat_heading_elem = (
+                        self.document.paragraphs[sh_idx]._element
+                    )
+                else:
+                    first_elem = (
+                        self.document.paragraphs[
+                            existing_para_indices[0]
+                        ]._element
+                    )
+                    first_existing_prev_elem = first_elem.getprevious()
+                    if first_existing_prev_elem is None:
+                        first_existing_prev_elem = anchor_elem
+
             _logging.info(
                 "[DocxHandler] inject: phase='%s' subcat='%s' "
                 "existing_paras=%d new_studies=%d anchor=%d "
@@ -735,19 +779,38 @@ class CVDocxHandler:
                 need_subcat_heading,
             )
 
-            if existing_para_indices:
-                existing_elems_with_year = []
-                for pidx in existing_para_indices:
-                    para = self.document.paragraphs[pidx]
-                    elem = para._element
-                    year_val = 0
-                    raw = self._merge_paragraph_text(para).strip()
-                    year_m = re.match(r'^(\d{4})', raw)
-                    if year_m:
-                        year_val = int(year_m.group(1))
-                    existing_elems_with_year.append(
-                        (elem, year_val, "", "", True)
-                    )
+            injection_plan.append({
+                "p_key": p_key,
+                "s_key": s_key,
+                "anchor_idx": anchor_idx,
+                "anchor_elem": anchor_elem,
+                "need_phase": need_phase_heading,
+                "need_subcat": need_subcat_heading,
+                "existing_para_indices": existing_para_indices,
+                "existing_elems_with_year": existing_elems_with_year,
+                "subcat_heading_elem": subcat_heading_elem,
+                "first_existing_prev_elem": first_existing_prev_elem,
+                "group": group,
+            })
+
+        # Sort by anchor_idx descending so higher-index insertions
+        # happen first; this prevents earlier insertions from shifting
+        # the paragraph positions used by later groups.
+        injection_plan.sort(key=lambda x: -x["anchor_idx"])
+
+        # --- Phase 2: process each group using pre-computed
+        #     element references (no index lookups). ---
+        for plan in injection_plan:
+            p_key = plan["p_key"]
+            s_key = plan["s_key"]
+            group = plan["group"]
+            phase_name = group["phase_name"]
+            subcat_name = group["subcat_name"]
+            new_studies = group["studies"]
+            anchor_elem = plan["anchor_elem"]
+
+            if plan["existing_para_indices"]:
+                existing_elems_with_year = plan["existing_elems_with_year"]
 
                 for elem, _, _, _, _ in existing_elems_with_year:
                     parent = elem.getparent()
@@ -758,10 +821,11 @@ class CVDocxHandler:
                 for study in new_studies:
                     use_red = (
                         protocol_red
-                        and p_key != normalize_heading_key("Uncategorized")
+                        and not is_uncategorized_key(p_key)
                     )
                     elem = self._create_study_element(
-                        study, include_protocol, use_red
+                        study, include_protocol, use_red,
+                        highlight=highlight_inserted,
                     )
                     new_elems_with_year.append(
                         (
@@ -779,28 +843,12 @@ class CVDocxHandler:
                     key=lambda t: (-t[1], t[2], t[3])
                 )
 
-                subcat_heading_idx = self._subcat_heading_para.get(
-                    subcat_tuple
-                )
-                if subcat_heading_idx is not None:
-                    insert_after_elem = (
-                        self.document.paragraphs[subcat_heading_idx]._element
-                    )
+                if plan["subcat_heading_elem"] is not None:
+                    insert_after_elem = plan["subcat_heading_elem"]
+                elif plan["first_existing_prev_elem"] is not None:
+                    insert_after_elem = plan["first_existing_prev_elem"]
                 else:
-                    if anchor_idx > 0:
-                        insert_after_elem = (
-                            self.document.paragraphs[
-                                existing_para_indices[0]
-                            ]._element.getprevious()
-                        )
-                        if insert_after_elem is None:
-                            insert_after_elem = (
-                                self.document.paragraphs[anchor_idx]._element
-                            )
-                    else:
-                        insert_after_elem = (
-                            self.document.paragraphs[anchor_idx]._element
-                        )
+                    insert_after_elem = anchor_elem
 
                 cursor = insert_after_elem
                 for elem, _, _, _, _ in combined:
@@ -808,10 +856,14 @@ class CVDocxHandler:
                     cursor = elem
 
             else:
-                anchor_elem = self.document.paragraphs[anchor_idx]._element
+                # Strip bottom border from anchor so it does not
+                # visually separate existing content from the newly
+                # inserted headings/studies.
+                self._strip_paragraph_bottom_border(anchor_elem)
+
                 cursor = anchor_elem
 
-                if need_phase_heading:
+                if plan["need_phase"]:
                     phase_elem = self._create_paragraph_element(
                         phase_name, is_heading=True
                     )
@@ -819,7 +871,7 @@ class CVDocxHandler:
                     cursor = phase_elem
                     total_inserted += 1
 
-                if need_subcat_heading:
+                if plan["need_subcat"]:
                     subcat_elem = self._create_paragraph_element(
                         subcat_name, is_heading=True
                     )
@@ -837,10 +889,11 @@ class CVDocxHandler:
                 for study in new_studies:
                     use_red = (
                         protocol_red
-                        and p_key != normalize_heading_key("Uncategorized")
+                        and not is_uncategorized_key(p_key)
                     )
                     elem = self._create_study_element(
-                        study, include_protocol, use_red
+                        study, include_protocol, use_red,
+                        highlight=highlight_inserted,
                     )
                     cursor.addnext(elem)
                     cursor = elem
@@ -852,15 +905,229 @@ class CVDocxHandler:
         )
         return total_inserted
 
+    def _strip_paragraph_bottom_border(self, para_element) -> None:
+        """Remove any bottom border from a paragraph element's properties.
+
+        Called before inserting new headings/studies after an anchor so
+        that the existing section-end border does not visually separate
+        old content from newly injected content.
+        """
+        pPr = para_element.find(qn('w:pPr'))
+        if pPr is None:
+            return
+        pBdr = pPr.find(qn('w:pBdr'))
+        if pBdr is None:
+            return
+        bottom = pBdr.find(qn('w:bottom'))
+        if bottom is not None:
+            pBdr.remove(bottom)
+            _logging.debug(
+                "[DocxHandler] Stripped bottom border from anchor paragraph"
+            )
+        if len(pBdr) == 0:
+            pPr.remove(pBdr)
+
+    def _replace_paragraph_with_masked(
+        self,
+        para,
+        masked_sponsor: str,
+        masked_description: str,
+        year: int,
+    ) -> None:
+        """Replace all runs of a study paragraph with masked content.
+
+        Preserves the paragraph element's position in the XML tree
+        (body or table cell) and its paragraph-level formatting
+        (indentation, spacing). Only the run-level content is replaced.
+        """
+        elem = para._element
+        for child in list(elem):
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag == 'r':
+                elem.remove(child)
+
+        def _add_run(text, bold=False):
+            r = OxmlElement('w:r')
+            rPr = OxmlElement('w:rPr')
+            rFonts = OxmlElement('w:rFonts')
+            rFonts.set(qn('w:ascii'), self.FONT_NAME)
+            rFonts.set(qn('w:hAnsi'), self.FONT_NAME)
+            rFonts.set(qn('w:eastAsia'), self.FONT_NAME)
+            rPr.append(rFonts)
+            _hp = str(int(self.FONT_SIZE.pt * 2))
+            sz = OxmlElement('w:sz')
+            sz.set(qn('w:val'), _hp)
+            rPr.append(sz)
+            szCs = OxmlElement('w:szCs')
+            szCs.set(qn('w:val'), _hp)
+            rPr.append(szCs)
+            if bold:
+                b = OxmlElement('w:b')
+                rPr.append(b)
+            r.append(rPr)
+            t = OxmlElement('w:t')
+            t.text = text
+            if text.startswith(' ') or text.endswith(' '):
+                t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+            r.append(t)
+            elem.append(r)
+
+        year_str = str(year) if year > 0 else ""
+        _add_run(year_str, bold=False)
+
+        r_tab = OxmlElement('w:r')
+        tab_elem = OxmlElement('w:tab')
+        r_tab.append(tab_elem)
+        elem.append(r_tab)
+
+        _add_run(masked_sponsor, bold=True)
+
+        desc_clean = masked_description
+        sponsor_lower = masked_sponsor.lower().strip()
+        desc_lower = desc_clean.lower().strip()
+        if sponsor_lower and desc_lower.startswith(sponsor_lower):
+            rest = desc_clean[len(masked_sponsor):].strip()
+            if rest.startswith(':'):
+                desc_clean = rest[1:].strip()
+
+        _add_run(f': {desc_clean}', bold=False)
+
+    def redact_studies_in_place(
+        self,
+        replacements: list,
+    ) -> int:
+        """Replace protocol-bearing study paragraphs in place.
+
+        Each item in *replacements* is a dict::
+
+            {
+                "para_idx": int,
+                "year": int,
+                "masked_sponsor": str,
+                "masked_description": str,
+            }
+
+        The paragraph at ``para_idx`` has its runs replaced with the
+        masked content while preserving its XML position (body or
+        table cell), paragraph-level formatting, and surrounding
+        structure. No paragraphs are added or removed.
+
+        Returns the number of paragraphs replaced.
+        """
+        count = 0
+        for rep in replacements:
+            para_idx = rep["para_idx"]
+            if para_idx < 0 or para_idx >= len(self.document.paragraphs):
+                _logging.warning(
+                    "[DocxHandler] redact_in_place: invalid para_idx=%d",
+                    para_idx,
+                )
+                continue
+            para = self.document.paragraphs[para_idx]
+            self._replace_paragraph_with_masked(
+                para,
+                rep["masked_sponsor"],
+                rep["masked_description"],
+                rep["year"],
+            )
+            count += 1
+            _logging.info(
+                "[DocxHandler] Replaced para %d with masked text "
+                "(sponsor='%s', year=%d)",
+                para_idx,
+                rep["masked_sponsor"],
+                rep["year"],
+            )
+        return count
+
+    def sort_subcategory_in_place(
+        self,
+        phase_key: str,
+        subcat_key: str,
+    ) -> None:
+        """Re-sort study paragraphs within one subcategory in place.
+
+        Removes existing study paragraph XML elements from the
+        subcategory, sorts them by (year desc, sponsor, protocol),
+        and reinserts them in order after the subcategory heading.
+        """
+        subcat_tuple = (phase_key, subcat_key)
+        para_indices = self._subcat_study_para_list.get(subcat_tuple, [])
+        if len(para_indices) <= 1:
+            return
+
+        elems_with_sort_key = []
+        for pidx in para_indices:
+            para = self.document.paragraphs[pidx]
+            elem = para._element
+            raw = self._merge_paragraph_text(para).strip()
+            year_val = 0
+            sponsor_val = ""
+            protocol_val = ""
+            year_m = re.match(r'^(\d{4})', raw)
+            if year_m:
+                year_val = int(year_m.group(1))
+            parsed = parse_study_line(raw)
+            if parsed:
+                _, sponsor_val, protocol_val, _ = parsed
+            elems_with_sort_key.append(
+                (elem, year_val, sponsor_val.lower(), protocol_val.lower())
+            )
+
+        for elem, _, _, _ in elems_with_sort_key:
+            parent = elem.getparent()
+            if parent is not None:
+                parent.remove(elem)
+
+        elems_with_sort_key.sort(
+            key=lambda t: (-t[1], t[2], t[3])
+        )
+
+        heading_idx = self._subcat_heading_para.get(subcat_tuple)
+        if heading_idx is not None:
+            cursor = self.document.paragraphs[heading_idx]._element
+        else:
+            cursor = self.document.paragraphs[
+                para_indices[0]
+            ]._element.getprevious()
+            if cursor is None:
+                _logging.warning(
+                    "[DocxHandler] sort_subcategory_in_place: no anchor "
+                    "for (%s, %s)",
+                    phase_key,
+                    subcat_key,
+                )
+                return
+
+        for elem, _, _, _ in elems_with_sort_key:
+            cursor.addnext(elem)
+            cursor = elem
+
+        _logging.info(
+            "[DocxHandler] Sorted %d studies in (%s, %s)",
+            len(elems_with_sort_key),
+            phase_key,
+            subcat_key,
+        )
+
     def write_research_experience(
         self,
         research_exp: ResearchExperience,
         include_protocol: bool = True,
-        protocol_red: bool = True
+        protocol_red: bool = True,
+        highlight_new: bool = False,
+        new_study_ids: set = None,
     ) -> None:
         """
         Write the Research Experience section to the document.
         Replaces existing content between start and end indices.
+
+        Args:
+            highlight_new: When True, newly inserted studies are highlighted yellow.
+            new_study_ids: Set of python object id()s for studies that existed in
+                the original CV.  Studies NOT in this set are considered new and
+                will be highlighted when highlight_new is True.  If None and
+                highlight_new is True, ALL studies are highlighted.
         """
         if self.research_exp_start_idx is None:
             raise ValueError("Research Experience section not found. Call find_research_experience_section first.")
@@ -901,8 +1168,18 @@ class CVDocxHandler:
                 # Studies
                 for study in subcategory.studies:
                     # Disable red protocol coloring for Uncategorized phase
-                    use_red = protocol_red and phase.name != "Uncategorized"
-                    study_para = self._create_study_element(study, include_protocol, use_red)
+                    use_red = protocol_red and not is_uncategorized_key(phase.name)
+                    # Determine if this study should be highlighted
+                    should_highlight = False
+                    if highlight_new:
+                        if new_study_ids is not None:
+                            should_highlight = id(study) not in new_study_ids
+                        else:
+                            should_highlight = True
+                    study_para = self._create_study_element(
+                        study, include_protocol, use_red,
+                        highlight=should_highlight,
+                    )
                     insert_after.addnext(study_para)
                     insert_after = study_para
         
@@ -1004,7 +1281,8 @@ class CVDocxHandler:
         p.append(r)
         return p
     
-    def _create_study_element(self, study: Study, include_protocol: bool, protocol_red: bool):
+    def _create_study_element(self, study: Study, include_protocol: bool, protocol_red: bool,
+                              highlight: bool = False):
         """Create a paragraph XML element for a study entry."""
         # Create paragraph
         p = OxmlElement('w:p')
@@ -1018,7 +1296,8 @@ class CVDocxHandler:
         p.append(pPr)
         
         # Helper to create a run with formatting
-        def create_run(text: str, bold: bool = False, red: bool = False):
+        def create_run(text: str, bold: bool = False, red: bool = False,
+                       highlight_run: bool = False):
             r = OxmlElement('w:r')
             rPr = OxmlElement('w:rPr')
             
@@ -1047,6 +1326,11 @@ class CVDocxHandler:
                 color.set(qn('w:val'), 'FF0000')
                 rPr.append(color)
             
+            if highlight_run:
+                hl = OxmlElement('w:highlight')
+                hl.set(qn('w:val'), 'yellow')
+                rPr.append(hl)
+            
             r.append(rPr)
             
             t = OxmlElement('w:t')
@@ -1067,13 +1351,14 @@ class CVDocxHandler:
         r_tab.append(tab)
         p.append(r_tab)
         
-        # Sponsor (bold)
-        p.append(create_run(study.sponsor, bold=True))
+        # Sponsor (bold) — highlighted when highlight=True
+        p.append(create_run(study.sponsor, bold=True, highlight_run=highlight))
         
-        # Protocol (bold + red, if present and included)
+        # Protocol (bold + red, if present and included) — highlighted when highlight=True
         if include_protocol and study.protocol:
             p.append(create_run(' ', bold=False))
-            p.append(create_run(study.protocol, bold=True, red=protocol_red))
+            p.append(create_run(study.protocol, bold=True, red=protocol_red,
+                               highlight_run=highlight))
         
         # Colon and description
         description = study.description_full if include_protocol else study.description_masked

@@ -93,6 +93,61 @@ def _make_master_xlsx(path: Path, studies_data=None):
     return path
 
 
+SEVEN_COL_HEADERS = [
+    "Phase", "Subcategory", "Year", "Sponsor", "Protocol",
+    "Masked Description", "Full Description",
+]
+
+
+def _make_master_xlsx_seven_col(path: Path, studies_data=None):
+    """Create a 7-column master .xlsx at *path*.
+
+    Default data mirrors the legacy fixture but in the new schema.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Studies"
+    for ci, h in enumerate(SEVEN_COL_HEADERS, 1):
+        ws.cell(row=1, column=ci, value=h)
+
+    if studies_data is None:
+        studies_data = [
+            ("Phase I", "Oncology", 2024, "Pfizer", "PF-99999",
+             "Pfizer: A Phase 1 study of XXX in advanced lung cancer",
+             "Pfizer PF-99999: A Phase 1 study of PF-99999 (pembrolizumab) in advanced lung cancer"),
+            ("Phase I", "Oncology", 2023, "Novartis", "NVS-789",
+             "Novartis: First-in-human study of XXX for metastatic breast cancer",
+             "Novartis NVS-789: First-in-human study of NVS-789 for metastatic breast cancer"),
+            ("Phase I", "Cardiology", 2024, "AstraZeneca", "AZ-111",
+             "AstraZeneca: Phase 1 trial of XXX in heart failure",
+             "AstraZeneca AZ-111: Phase 1 trial of AZ-111 (dapagliflozin) in heart failure"),
+            ("Phase II\u2013IV", "Oncology", 2024, "Roche", "RO-777",
+             "Roche: Phase 3 study of XXX vs placebo in TNBC",
+             "Roche RO-777: Phase 3 study of RO-777 (atezolizumab) vs placebo in TNBC"),
+            ("Phase II\u2013IV", "Oncology", 2023, "Roche", "RO-555",
+             "Roche: Phase 3 randomized trial of XXX vs standard of care in NSCLC",
+             "Roche RO-555: Phase 3 randomized trial of RO-555 vs standard of care in NSCLC"),
+            ("Phase II\u2013IV", "Oncology", 2020, "BMS", "BMS-222",
+             "BMS: Phase 2 study of XXX immunotherapy in melanoma",
+             "BMS BMS-222: Phase 2 study of BMS-222 immunotherapy in melanoma"),
+        ]
+
+    for ri, row in enumerate(studies_data, 2):
+        for ci, val in enumerate(row, 1):
+            ws.cell(row=ri, column=ci, value=val)
+
+    wb.save(path)
+    wb.close()
+    return path
+
+
+@pytest.fixture
+def sample_master_xlsx_seven_col(tmp_dir):
+    """Create and return path to a 7-column master .xlsx file."""
+    path = tmp_dir / "master_7col.xlsx"
+    return _make_master_xlsx_seven_col(path)
+
+
 @pytest.fixture
 def sample_master_xlsx(tmp_dir):
     """Create and return a path to a sample master .xlsx file."""

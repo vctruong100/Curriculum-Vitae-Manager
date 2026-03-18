@@ -275,6 +275,65 @@ class DatabaseManager:
             return None
         
         return json.loads(row['order_data'])
+
+    def _ensure_category_order_entries(self, site_id: int, entries: List[tuple]) -> None:
+        """Ensure that each (phase, subcategory) pair exists in the category_order.
+
+        New entries are appended at the end.  Existing entries are not moved.
+        This is idempotent: calling it again with the same pairs is a no-op.
+
+        Args:
+            site_id: The site to update.
+            entries: List of (phase_display_name, subcategory_display_name) tuples.
+        """
+        if not entries:
+            return
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            'SELECT order_data FROM category_order WHERE site_id = ?',
+            (site_id,),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            current_order = json.loads(row['order_data'])
+        else:
+            current_order = []
+
+        existing_set = set(current_order)
+        changed = False
+        for phase, subcategory in entries:
+            key = f"{phase} > {subcategory}"
+            if key not in existing_set:
+                current_order.append(key)
+                existing_set.add(key)
+                changed = True
+                db_logger.info(
+                    "[DB] Category order extended for site %d: "
+                    "appended '%s' at index %d",
+                    site_id,
+                    key,
+                    len(current_order) - 1,
+                )
+
+        if not changed:
+            return
+
+        now = datetime.now().isoformat()
+        order_json = json.dumps(current_order)
+        cursor.execute(
+            'INSERT OR REPLACE INTO category_order '
+            '(site_id, order_data, updated_at) VALUES (?, ?, ?)',
+            (site_id, order_json, now),
+        )
+        conn.commit()
+        db_logger.info(
+            "[DB] Category order saved for site %d: %d entries total",
+            site_id,
+            len(current_order),
+        )
     
     # ==================== Study Operations ====================
     
@@ -305,6 +364,10 @@ class DatabaseManager:
         ''', (now, site_id))
         
         conn.commit()
+
+        self._ensure_category_order_entries(
+            site_id, [(study.phase, study.subcategory)]
+        )
         
         study.id = cursor.lastrowid
         study.site_id = site_id
@@ -374,6 +437,11 @@ class DatabaseManager:
         ''', (now, study.site_id))
         
         conn.commit()
+
+        self._ensure_category_order_entries(
+            study.site_id, [(study.phase, study.subcategory)]
+        )
+
         return cursor.rowcount > 0
     
     def delete_study(self, study_id: int, site_id: int) -> bool:
@@ -426,6 +494,12 @@ class DatabaseManager:
         ''', (now, site_id))
         
         conn.commit()
+
+        unique_entries = list({
+            (s.phase, s.subcategory) for s in studies
+        })
+        self._ensure_category_order_entries(site_id, unique_entries)
+
         return count
     
     # ==================== Backup & Version Operations ====================

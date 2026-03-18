@@ -77,6 +77,16 @@ def normalize_subcat_key(text: str) -> str:
     text = re.sub(r'["\u201c\u201d\u201e\u201f]', '"', text)
     return PHASE_SYNONYMS.get(text, text)
 
+
+def is_uncategorized_key(text: str) -> bool:
+    """Return True if *text* normalizes to the canonical 'Uncategorized' key.
+
+    This matches both the hard-coded default and any configured label whose
+    casefold equals 'uncategorized'.
+    """
+    key = normalize_heading_key(text)
+    return key == "Uncategorized" or text.strip().casefold() == "uncategorized"
+
 # Protocol detection regex
 PROTOCOL_REGEX = re.compile(r'([A-Za-z]{1,10}-?\d[\w-]*)')
 
@@ -584,6 +594,55 @@ def is_phase_heading(text: str) -> Optional[str]:
         return "Uncategorized"
 
     return None
+
+
+SPONSOR_PROTOCOL_RE = re.compile(
+    r'^(?P<sponsor>[A-Z][A-Za-z&\s\-\.]+?)\s+'
+    r'(?P<protocol>[A-Za-z]{1,10}[\-]?\d[\w\-]*)',
+    re.UNICODE,
+)
+
+
+def contains_protocol_token(text: str) -> bool:
+    """Return True if *text* contains a sponsor+protocol token.
+
+    Uses combined heuristics:
+      1. NFC + casefold + whitespace collapse + dash canonicalization.
+      2. ``extract_protocol`` for the protocol part.
+      3. Cross-check that a sponsor-like prefix precedes the protocol.
+
+    Does NOT rely on font colour or bold style.
+    """
+    normed = unicodedata.normalize('NFC', text)
+    normed = re.sub(r'[\s\t]+', ' ', normed).strip()
+    normed = re.sub(r'[–—−‐‑‒―]', '-', normed)
+    normed = re.sub('[\u2018\u2019\u201a\u201b]', "'", normed)
+    normed = re.sub('[\u201c\u201d\u201e\u201f]', '"', normed)
+
+    proto = extract_protocol(normed)
+    if proto is None:
+        return False
+
+    proto_idx = normed.find(proto)
+    if proto_idx <= 0:
+        return False
+
+    prefix = normed[:proto_idx].strip()
+    if len(prefix) < 2:
+        return False
+
+    return True
+
+
+def is_already_masked(text: str) -> bool:
+    """Return True if *text* looks like an already-masked study line.
+
+    A masked line uses XXX (or multiple Xs) in place of the protocol
+    and treatment names, and does NOT contain a protocol token.
+    """
+    if 'XXX' not in text.upper() and 'xxx' not in text.lower():
+        return False
+    return not contains_protocol_token(text)
 
 
 def is_year_line(text: str) -> bool:

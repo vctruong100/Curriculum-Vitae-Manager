@@ -14,7 +14,8 @@ import shutil
 from models import Study, ResearchExperience, OperationResult, LogEntry
 from normalizer import (
     normalize_for_matching, match_study_to_master, normalize_phase,
-    collapse_x_runs
+    collapse_x_runs, contains_protocol_token, is_already_masked,
+    normalize_heading_key, normalize_subcat_key, is_uncategorized_key,
 )
 from docx_handler import CVDocxHandler, validate_cv_docx
 from excel_parser import parse_master_xlsx, validate_master_xlsx, studies_to_research_experience
@@ -135,7 +136,7 @@ class CVProcessor:
 
         original_name = self._derive_original_cv_name(cv_path)
         date_str = datetime.now().strftime("%Y-%m-%d")
-        result_dir = Path(__file__).parent.parent / "result" / original_name
+        result_dir = self.config.get_result_root() / original_name
         result_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"{original_name} ({suffix_label} {date_str}){cv_path.suffix}"
@@ -390,7 +391,8 @@ class CVProcessor:
                     )
                 else:
                     # No match - keep original but in Uncategorized
-                    phase = new_research.get_or_create_phase("Uncategorized")
+                    uncat_label = self.config.uncategorized_label
+                    phase = new_research.get_or_create_phase(uncat_label)
                     subcategory = phase.get_or_create_subcategory("General")
                     subcategory.studies.append(cv_study)
                     _existing_study_ids.append((id(cv_study), cv_study))
@@ -401,7 +403,7 @@ class CVProcessor:
                         cv_study.year,
                         cv_study.sponsor,
                         cv_study.protocol,
-                        "No match in master - kept in Uncategorized"
+                        f"No match in master - kept in {self.config.uncategorized_label}"
                     )
             
             # Step 2: Inject master studies not in CV
@@ -470,13 +472,35 @@ class CVProcessor:
                 log_csv = logger.save_csv()
                 return logger.to_result(True, error_message="No studies to process")
             
-            # Sort the structure
+            # Resolve highlight_inserted from config
+            highlight_inserted = self.config.highlight_inserted
+            logging.info(
+                "[Processor] highlight_inserted=%s",
+                highlight_inserted,
+            )
+
+            # Build existing object ID set (used by both paths)
+            existing_obj_ids = set(
+                obj_id for obj_id, _ in _existing_study_ids
+            )
+
+            # Ensure category order entries for all phase/subcat combos in this run
             custom_order = None
             if site_id:
                 try:
                     with DatabaseManager(config=self.config) as db:
+                        order_entries = []
+                        for phase in new_research.phases:
+                            for subcat in phase.subcategories:
+                                order_entries.append((phase.name, subcat.name))
+                        if order_entries:
+                            db._ensure_category_order_entries(site_id, order_entries)
+                            logging.info(
+                                "[Processor] Ensured %d phase/subcat entries in category order",
+                                len(order_entries),
+                            )
                         custom_order = db.get_category_order(site_id)
-                except:
+                except Exception:
                     pass
             
             if enable_sort_existing:
@@ -491,7 +515,9 @@ class CVProcessor:
                 handler.write_research_experience(
                     new_research,
                     include_protocol=True,
-                    protocol_red=True
+                    protocol_red=True,
+                    highlight_new=highlight_inserted,
+                    new_study_ids=existing_obj_ids if highlight_inserted else None,
                 )
             else:
                 # --- Path B: Preserve existing paragraphs completely ---
@@ -526,6 +552,7 @@ class CVProcessor:
                     new_studies_for_injection,
                     include_protocol=True,
                     protocol_red=True,
+                    highlight_inserted=highlight_inserted,
                 )
 
                 logger.log(
@@ -719,58 +746,109 @@ class CVProcessor:
         master_path: Optional[Path] = None,
         site_id: Optional[int] = None,
         output_path: Optional[Path] = None,
+        sort_and_format: bool = False,
     ) -> OperationResult:
-        """
-        Mode B: Redact Protocols
-        
-        - For each CV study, match to master by Year and Column B
-        - Replace with Column C (masked - no protocol, treatments as XXX)
-        - Keep hierarchy and sorting
-        
-        Returns: OperationResult with details
+        """Mode B: Redact Protocols (in-place replacement).
+
+        Only studies that contain a protocol token are redacted.
+        Non-protocol studies are never touched. Already-masked lines
+        are detected and skipped for idempotency.
+
+        Args:
+            sort_and_format: When True, subcategories that received at
+                least one replacement are re-sorted (year desc, sponsor,
+                protocol) after redaction.  Subcategories with zero
+                replacements are untouched.  Default False.
         """
         logger = OperationLogger(config=self.config)
         logger.start_operation("Mode B - Redact Protocols")
-        
-        # Validate CV
+        logger.log(
+            "config",
+            details=f"sort_and_format={sort_and_format}",
+        )
+        logging.info(
+            "[Processor] mode_b_redact_protocols: sort_and_format=%s",
+            sort_and_format,
+        )
+
         is_valid, error = validate_cv_docx(cv_path)
         if not is_valid:
             return logger.to_result(False, error_message=error)
-        
-        # Get master studies
+
         master_studies, error = self._get_master_studies(master_path, site_id)
         if error:
             return logger.to_result(False, error_message=error)
-        
+
         if not master_studies:
-            return logger.to_result(False, error_message="No studies found in master source")
-        
+            return logger.to_result(
+                False, error_message="No studies found in master source"
+            )
+
         try:
-            # Load and parse CV
             handler = CVDocxHandler(
                 cv_path,
                 font_name=self.config.font_name,
                 font_size=self.config.font_size,
             )
             handler.load()
-            
+
             start_idx, end_idx = handler.find_research_experience_section()
             if start_idx is None:
                 return logger.to_result(
                     False,
-                    error_message="Research Experience section not found in CV"
+                    error_message="Research Experience section not found in CV",
                 )
-            
+
             cv_research = handler.parse_research_experience()
-            
-            # Process each study: match and redact
-            # IMPORTANT: All studies are kept - we only modify matched ones
-            changes_made = False
-            
+
+            replacements = []
+            affected_subcats = set()
+
             for phase in cv_research.phases:
+                p_key = normalize_heading_key(phase.name)
                 for subcategory in phase.subcategories:
-                    for study in subcategory.studies:
-                        # Try to match to master
+                    s_key = normalize_subcat_key(subcategory.name)
+                    subcat_tuple = (p_key, s_key)
+                    study_para_list = handler._subcat_study_para_list.get(
+                        subcat_tuple, []
+                    )
+
+                    for idx_in_list, study in enumerate(subcategory.studies):
+                        raw_text = study.description_full
+                        full_line = (
+                            f"{study.sponsor} {study.protocol}: {raw_text}"
+                            if study.protocol
+                            else f"{study.sponsor}: {raw_text}"
+                        )
+
+                        if is_already_masked(full_line):
+                            logger.log(
+                                "skipped-already-masked",
+                                phase=phase.name,
+                                subcategory=subcategory.name,
+                                year=study.year,
+                                sponsor=study.sponsor,
+                                protocol="",
+                                details="Line already masked — skipped",
+                            )
+                            logging.debug(
+                                "[Processor] Skipped already-masked: %s",
+                                full_line[:80],
+                            )
+                            continue
+
+                        if not contains_protocol_token(full_line):
+                            logger.log(
+                                "skipped-no-protocol",
+                                phase=phase.name,
+                                subcategory=subcategory.name,
+                                year=study.year,
+                                sponsor=study.sponsor,
+                                protocol="",
+                                details="No protocol token — not redacted",
+                            )
+                            continue
+
                         match_result = match_study_to_master(
                             study.year,
                             study.sponsor,
@@ -780,85 +858,98 @@ class CVProcessor:
                             self.config.fuzzy_threshold_full,
                             self.config.fuzzy_threshold_masked,
                         )
-                        
-                        if match_result:
-                            matched_study, match_type, score = match_result
-                            
-                            # Update study with masked version from master
-                            old_protocol = study.protocol
-                            study.protocol = ""  # Remove protocol
-                            
-                            # Use master's masked description (already excludes sponsor prefix)
-                            study.description_masked = matched_study.description_masked
-                            # Also use master's sponsor to ensure consistency
-                            study.sponsor = matched_study.sponsor
-                            
-                            logger.log_replaced(
-                                phase.name,
-                                subcategory.name,
-                                study.year,
-                                study.sponsor,
-                                old_protocol,
-                                f"Matched ({match_type}, score={score}), redacted protocol"
+
+                        if not match_result:
+                            logger.log(
+                                "skipped-no-protocol",
+                                phase=phase.name,
+                                subcategory=subcategory.name,
+                                year=study.year,
+                                sponsor=study.sponsor,
+                                protocol=study.protocol,
+                                details=(
+                                    "Protocol present but no master match — "
+                                    "kept original"
+                                ),
                             )
-                            changes_made = True
+                            continue
+
+                        matched_study, match_type, score = match_result
+
+                        if idx_in_list < len(study_para_list):
+                            para_idx = study_para_list[idx_in_list]
                         else:
-                            # No match found - study might already be masked or not in master
-                            # KEEP THE STUDY AS-IS (don't lose it!)
-                            # Remove protocol if present, but keep description as-is
-                            if study.protocol:
-                                study.protocol = ""
-                            # Log that we kept it without matching
-                            logger.log_skipped_no_match(
-                                phase.name,
-                                subcategory.name,
-                                study.year,
-                                study.sponsor,
-                                "",  # Protocol already removed
-                                "No match in master - kept original, removed protocol"
+                            para_idx = handler._subcat_last_study_para.get(
+                                subcat_tuple, -1
                             )
-            
-            # Sort the structure - apply custom order if available
-            custom_order = None
-            if site_id:
-                try:
-                    with DatabaseManager(config=self.config) as db:
-                        custom_order = db.get_category_order(site_id)
-                except:
-                    pass
-            
-            if custom_order:
-                cv_research.sort_all_custom(custom_order)
-            else:
-                cv_research.sort_all()
-            
-            # Write back to document (no protocol, not red)
-            handler.write_research_experience(
-                cv_research,
-                include_protocol=False,
-                protocol_red=False
+
+                        replacements.append({
+                            "para_idx": para_idx,
+                            "year": study.year,
+                            "masked_sponsor": matched_study.sponsor,
+                            "masked_description": matched_study.description_masked,
+                            "phase": phase.name,
+                            "subcategory": subcategory.name,
+                            "protocol": study.protocol,
+                            "match_type": match_type,
+                            "score": score,
+                        })
+                        affected_subcats.add(subcat_tuple)
+
+                        logger.log_replaced(
+                            phase.name,
+                            subcategory.name,
+                            study.year,
+                            matched_study.sponsor,
+                            study.protocol,
+                            (
+                                f"Matched ({match_type}, score={score}), "
+                                f"redacted in place at para {para_idx}"
+                            ),
+                        )
+
+            replaced_count = handler.redact_studies_in_place(replacements)
+            logging.info(
+                "[Processor] Redacted %d paragraphs in place", replaced_count,
             )
-            
+
+            if sort_and_format and affected_subcats:
+                logging.info(
+                    "[Processor] Re-sorting %d affected subcategories",
+                    len(affected_subcats),
+                )
+                for (pk, sk) in affected_subcats:
+                    handler.sort_subcategory_in_place(pk, sk)
+                    logger.log(
+                        "sort-category",
+                        details=(
+                            f"Re-sorted subcategory ({pk}, {sk}) "
+                            f"after redaction"
+                        ),
+                    )
+
             if output_path is None:
                 output_path = self._resolve_output_path(
-                    cv_path, suffix_label="Redacted"
+                    cv_path, suffix_label="Redacted",
                 )
 
             original_name = self._derive_original_cv_name(cv_path)
             self._set_original_cv_name(handler, original_name)
-            
+
             try:
                 handler.save(output_path)
             except PermissionError:
                 raise FilePermissionError(output_path, "save")
-            
+
             log_json = logger.save_json()
             log_csv = logger.save_csv()
-            
+
             return logger.to_result(True, str(output_path))
-            
+
         except Exception as e:
-            return logger.to_result(False, error_message=f"Processing error: {str(e)}")
+            return logger.to_result(
+                False, error_message=f"Processing error: {str(e)}"
+            )
     
     def preview_changes(
         self,
@@ -867,31 +958,32 @@ class CVProcessor:
         site_id: Optional[int] = None,
         mode: str = "update_inject",
         enable_sort_existing: Optional[bool] = None,
+        sort_and_format: bool = False,
     ) -> Tuple[List[dict], str]:
-        """
-        Preview changes that would be made without applying them.
-        
+        """Preview changes that would be made without applying them.
+
         Returns: (list of changes, error_message)
         """
         if enable_sort_existing is None:
             enable_sort_existing = self.config.enable_sort_existing
         logging.info(
-            "[Processor] preview_changes: enable_sort_existing=%s",
+            "[Processor] preview_changes: enable_sort_existing=%s, "
+            "sort_and_format=%s",
             enable_sort_existing,
+            sort_and_format,
         )
-        # Validate CV
+
         is_valid, error = validate_cv_docx(cv_path)
         if not is_valid:
             return [], error
-        
-        # Get master studies
+
         master_studies, error = self._get_master_studies(master_path, site_id)
         if error:
             return [], error
-        
+
         if not master_studies:
             return [], "No studies found in master source"
-        
+
         try:
             handler = CVDocxHandler(
                 cv_path,
@@ -899,41 +991,54 @@ class CVProcessor:
                 font_size=self.config.font_size,
             )
             handler.load()
-            
+
             start_idx, end_idx = handler.find_research_experience_section()
             if start_idx is None:
                 return [], "Research Experience section not found in CV"
-            
+
             cv_research = handler.parse_research_experience()
             changes = []
-            
+
             if mode == "update_inject":
                 benchmark_year = cv_research.calculate_benchmark_year(
                     self.config.benchmark_min_count
                 )
-                existing_identities = self._build_identity_set(cv_research.get_all_studies())
-                
+                existing_identities = self._build_identity_set(
+                    cv_research.get_all_studies()
+                )
+
                 for master_study in master_studies:
                     if master_study.year <= benchmark_year:
                         continue
-                    
-                    master_normalized = normalize_for_matching(master_study.description_masked)
-                    master_identity = master_study.get_identity_tuple(master_normalized)
-                    
+
+                    master_normalized = normalize_for_matching(
+                        master_study.description_masked
+                    )
+                    master_identity = master_study.get_identity_tuple(
+                        master_normalized
+                    )
+
                     if master_identity not in existing_identities:
-                        from normalizer import normalize_heading_key, normalize_subcat_key
-                        prev_phase_key = normalize_heading_key(master_study.phase)
-                        prev_subcat_key = normalize_subcat_key(master_study.subcategory)
+                        prev_phase_key = normalize_heading_key(
+                            master_study.phase
+                        )
+                        prev_subcat_key = normalize_subcat_key(
+                            master_study.subcategory
+                        )
                         matched_phase_node = None
                         matched_subcat_node = None
                         for p in cv_research.phases:
                             if normalize_heading_key(p.name) == prev_phase_key:
                                 matched_phase_node = p.name
                                 for sc in p.subcategories:
-                                    if normalize_subcat_key(sc.name) == prev_subcat_key:
+                                    if (
+                                        normalize_subcat_key(sc.name)
+                                        == prev_subcat_key
+                                    ):
                                         matched_subcat_node = sc.name
                                         break
                                 break
+                        desc_text = master_study.description_full
                         change_entry = {
                             "action": "inject",
                             "phase": master_study.phase,
@@ -945,16 +1050,64 @@ class CVProcessor:
                             "year": master_study.year,
                             "sponsor": master_study.sponsor,
                             "protocol": master_study.protocol,
-                            "description": master_study.description_full[:100] + "..." if len(master_study.description_full) > 100 else master_study.description_full,
+                            "description": (
+                                desc_text[:100] + "..."
+                                if len(desc_text) > 100
+                                else desc_text
+                            ),
                             "enable_sort_existing": enable_sort_existing,
                         }
                         changes.append(change_entry)
                         existing_identities.add(master_identity)
-            
+
             elif mode == "redact_protocols":
+                affected_subcats_preview = set()
                 for phase in cv_research.phases:
+                    p_key = normalize_heading_key(phase.name)
                     for subcategory in phase.subcategories:
-                        for study in subcategory.studies:
+                        s_key = normalize_subcat_key(subcategory.name)
+                        subcat_tuple = (p_key, s_key)
+                        study_para_list = (
+                            handler._subcat_study_para_list.get(
+                                subcat_tuple, []
+                            )
+                        )
+
+                        for idx_in_list, study in enumerate(
+                            subcategory.studies
+                        ):
+                            full_line = (
+                                f"{study.sponsor} {study.protocol}: "
+                                f"{study.description_full}"
+                                if study.protocol
+                                else f"{study.sponsor}: "
+                                     f"{study.description_full}"
+                            )
+
+                            if is_already_masked(full_line):
+                                changes.append({
+                                    "action": "skipped-already-masked",
+                                    "phase": phase.name,
+                                    "subcategory": subcategory.name,
+                                    "year": study.year,
+                                    "sponsor": study.sponsor,
+                                    "protocol": "",
+                                    "reason": "Already masked",
+                                })
+                                continue
+
+                            if not contains_protocol_token(full_line):
+                                changes.append({
+                                    "action": "skipped-no-protocol",
+                                    "phase": phase.name,
+                                    "subcategory": subcategory.name,
+                                    "year": study.year,
+                                    "sponsor": study.sponsor,
+                                    "protocol": "",
+                                    "reason": "No protocol token",
+                                })
+                                continue
+
                             match_result = match_study_to_master(
                                 study.year,
                                 study.sponsor,
@@ -964,9 +1117,18 @@ class CVProcessor:
                                 self.config.fuzzy_threshold_full,
                                 self.config.fuzzy_threshold_masked,
                             )
-                            
+
                             if match_result:
-                                matched_study, match_type, score = match_result
+                                matched_study, match_type, score = (
+                                    match_result
+                                )
+                                anchor_idx = -1
+                                if idx_in_list < len(study_para_list):
+                                    anchor_idx = study_para_list[idx_in_list]
+                                masked_desc = (
+                                    matched_study.description_masked
+                                )
+                                affected_subcats_preview.add(subcat_tuple)
                                 changes.append({
                                     "action": "redact",
                                     "phase": phase.name,
@@ -974,11 +1136,43 @@ class CVProcessor:
                                     "year": study.year,
                                     "sponsor": study.sponsor,
                                     "protocol": study.protocol,
+                                    "match_type": match_type,
                                     "match_score": score,
-                                    "new_description": matched_study.description_masked[:100] + "..." if len(matched_study.description_masked) > 100 else matched_study.description_masked,
+                                    "anchor_para_idx": anchor_idx,
+                                    "new_sponsor": matched_study.sponsor,
+                                    "new_description": (
+                                        masked_desc[:100] + "..."
+                                        if len(masked_desc) > 100
+                                        else masked_desc
+                                    ),
+                                    "sort_and_format": sort_and_format,
+                                    "would_resort_category": (
+                                        sort_and_format
+                                    ),
                                 })
-            
+                            else:
+                                changes.append({
+                                    "action": "skipped-no-match",
+                                    "phase": phase.name,
+                                    "subcategory": subcategory.name,
+                                    "year": study.year,
+                                    "sponsor": study.sponsor,
+                                    "protocol": study.protocol,
+                                    "reason": (
+                                        "Protocol present but no master match"
+                                    ),
+                                })
+
+                if sort_and_format and affected_subcats_preview:
+                    for c in changes:
+                        if c.get("action") == "redact":
+                            pk = normalize_heading_key(c["phase"])
+                            sk = normalize_subcat_key(c["subcategory"])
+                            c["would_resort_category"] = (
+                                (pk, sk) in affected_subcats_preview
+                            )
+
             return changes, ""
-            
+
         except Exception as e:
             return [], f"Preview error: {str(e)}"

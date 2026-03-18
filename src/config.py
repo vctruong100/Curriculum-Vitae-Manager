@@ -11,6 +11,9 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 
+DEFAULT_UNCATEGORIZED_LABEL = "Uncategorized"
+
+
 ALLOWED_FONTS = [
     "Calibri",
     "Times New Roman",
@@ -85,6 +88,9 @@ class AppConfig:
     # Sorting behavior for Update/Inject mode
     enable_sort_existing: bool = True
 
+    # Configurable label for the "Uncategorized" subcategory
+    uncategorized_label: str = "Uncategorized"
+
     # Offline guard (default ON)
     offline_guard_enabled: bool = True
 
@@ -114,6 +120,8 @@ class AppConfig:
             _errors.append(f"log_retention_days must be int >= 1, got {self.log_retention_days!r}")
         if not isinstance(self.enable_sort_existing, bool):
             _errors.append(f"enable_sort_existing must be bool, got {self.enable_sort_existing!r}")
+        if not isinstance(self.uncategorized_label, str) or not self.uncategorized_label.strip():
+            _errors.append(f"uncategorized_label must be a non-empty string, got {self.uncategorized_label!r}")
         if self.manual_benchmark_year is not None:
             if not isinstance(self.manual_benchmark_year, int) or not (1900 <= self.manual_benchmark_year <= 2100):
                 _errors.append(f"manual_benchmark_year must be int 1900-2100 or None, got {self.manual_benchmark_year!r}")
@@ -160,6 +168,18 @@ class AppConfig:
     def get_user_results_path(self, user_id: Optional[str] = None) -> Path:
         """Get the results directory for a user."""
         return self.get_user_data_path(user_id) / "results"
+
+    def get_result_root(self) -> Path:
+        """Get the root directory for output result files (.docx, .xlsx exports).
+
+        In production (default data_root), this returns ``<project_root>/result/``.
+        When ``data_root`` is overridden (e.g. in tests), returns ``<data_root>/result/``
+        so tests never pollute the real result folder.
+        """
+        default_root = str(get_default_data_root())
+        if self.data_root == default_root:
+            return get_app_root() / "result"
+        return Path(self.data_root) / "result"
     
     def get_temp_path(self) -> Path:
         """Get the temporary files directory."""
