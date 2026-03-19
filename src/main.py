@@ -15,14 +15,21 @@ import sys
 import os
 import json
 import logging
+import atexit
 from pathlib import Path
 
-# Ensure we can import from the application directory
-app_dir = Path(__file__).parent.resolve()
-if str(app_dir) not in sys.path:
-    sys.path.insert(0, str(app_dir))
+if getattr(sys, "frozen", False):
+    _app_dir = Path(sys.executable).parent.resolve()
+    os.chdir(str(_app_dir))
+    _src_in_bundle = str(Path(sys._MEIPASS))
+    if _src_in_bundle not in sys.path:
+        sys.path.insert(0, _src_in_bundle)
+else:
+    _app_dir = Path(__file__).parent.resolve()
+    if str(_app_dir) not in sys.path:
+        sys.path.insert(0, str(_app_dir))
 
-from config import get_config, AppConfig
+from config import get_config, AppConfig, APP_VERSION, APP_NAME
 
 
 def check_dependencies():
@@ -162,6 +169,12 @@ Examples:
         help='Output structured JSON instead of plain text'
     )
     
+    parser.add_argument(
+        '--check-updates',
+        action='store_true',
+        help='One-time check for a newer release on GitHub (requires network)'
+    )
+
     sort_group = parser.add_mutually_exclusive_group()
     sort_group.add_argument(
         '--sort-existing',
@@ -179,6 +192,21 @@ Examples:
     
     args = parser.parse_args()
     
+    if args.check_updates:
+        try:
+            from update_checker import check_for_update, APP_VERSION
+            print(f"Current version: {APP_VERSION}")
+            print("Checking for updates...")
+            info = check_for_update()
+            if info:
+                print(f"Newer version available: {info['tag_name']}")
+                print(f"  Release page: {info['html_url']}")
+            else:
+                print("You are running the latest version.")
+        except Exception as exc:
+            print(f"Update check failed: {exc}")
+        return
+
     if args.mode == 'gui':
         run_gui()
         return
@@ -377,55 +405,70 @@ Examples:
 
 def main():
     """Main entry point."""
-    # Configure logging
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
     )
-    
-    # Check dependencies
+
+    logger = logging.getLogger(__name__)
+    logger.info("%s v%s starting (frozen=%s)", APP_NAME, APP_VERSION, getattr(sys, "frozen", False))
+
     if not check_dependencies():
         sys.exit(1)
-    
-    # Check write permissions
+
     if not check_writable():
         sys.exit(1)
-    
-    # Initialize config
+
     config = get_config()
     config.ensure_user_directories()
-    
-    # Verify network is disabled (safety check)
+
     if config.network_enabled:
         print("Warning: network_enabled was set to True. Forcing to False for offline operation.")
         config.network_enabled = False
         config.save()
-    
-    # Offline guard
+
     if config.offline_guard_enabled:
         try:
             from offline_guard import enforce_offline
             enforce_offline(fail_fast=False, block_sockets=True)
         except Exception as exc:
-            logging.getLogger(__name__).warning("Offline guard warning: %s", exc)
-    
-    # Enforce permissions on user directory
+            logger.warning("Offline guard warning: %s", exc)
+
     try:
         from permissions import secure_user_directory, prune_user_backups, prune_user_logs
         user_path = config.get_user_data_path()
         secure_user_directory(user_path)
-        # Prune old backups and logs according to retention policy
         prune_user_backups(user_path, config.backup_retention_days)
         prune_user_logs(user_path, config.log_retention_days)
     except Exception as exc:
-        logging.getLogger(__name__).warning("Permissions/pruning warning: %s", exc)
-    
-    # Run based on command line args
-    if len(sys.argv) > 1:
-        run_cli()
-    else:
+        logger.warning("Permissions/pruning warning: %s", exc)
+
+    is_gui = len(sys.argv) <= 1
+
+    if is_gui:
+        from instance_lock import acquire_instance_lock, release_instance_lock
+        lock_dir = str(config.get_user_data_path())
+        if not acquire_instance_lock(lock_dir):
+            print("Another instance of CV Manager is already running.")
+            try:
+                import tkinter as _tk
+                _r = _tk.Tk()
+                _r.withdraw()
+                from tkinter import messagebox as _mb
+                _mb.showwarning(
+                    APP_NAME,
+                    "Another instance is already running.\n"
+                    "Please close it before starting a new one.",
+                )
+                _r.destroy()
+            except Exception:
+                pass
+            sys.exit(1)
+        atexit.register(release_instance_lock)
         run_gui()
+    else:
+        run_cli()
 
 
 if __name__ == "__main__":

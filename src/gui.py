@@ -14,7 +14,8 @@ from datetime import datetime
 
 import re
 
-from config import get_config, set_config, AppConfig, get_os_username, get_app_root, ALLOWED_FONTS
+from config import get_config, set_config, AppConfig, get_os_username, get_app_root, ALLOWED_FONTS, APP_VERSION, APP_NAME, HANGING_INDENT_MIN, HANGING_INDENT_MAX, DEFAULT_ICON_PATH
+from resource_path import resource_path
 from tooltip_text import get_tooltip_text, TOOLTIP_MAX_WIDTH
 from models import Study, Site
 from database import DatabaseManager
@@ -23,6 +24,7 @@ from import_export import ImportExportManager
 from normalizer import normalize_phase, validate_year
 from progress_dialog import run_with_progress
 from error_handler import FilePermissionError
+from undo_buffer import UndoBuffer
 
 
 class CVManagerApp:
@@ -30,7 +32,7 @@ class CVManagerApp:
     
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("CV Research Experience Manager (Offline)")
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self.root.geometry("1000x900")
         self.root.minsize(800, 900)
         
@@ -45,7 +47,13 @@ class CVManagerApp:
         self.cv_path: Optional[Path] = None
         self.master_path: Optional[Path] = None
         self.selected_site_id: Optional[int] = None
+
+        # Undo buffer for Mode C delete
+        self._undo_buffer = UndoBuffer()
         
+        # Set window icon
+        self._set_app_icon()
+
         # Setup UI
         self._setup_styles()
         self._create_menu()
@@ -60,6 +68,18 @@ class CVManagerApp:
         # Refresh sites list
         self._refresh_sites()
     
+    def _set_app_icon(self):
+        """Set the application window icon from bundled or local assets."""
+        try:
+            ico_path = resource_path(DEFAULT_ICON_PATH)
+            if ico_path.exists():
+                self.root.iconbitmap(str(ico_path))
+                logging.info("[GUI] Window icon set from %s", ico_path)
+            else:
+                logging.debug("[GUI] Icon not found at %s — using default", ico_path)
+        except Exception as exc:
+            logging.debug("[GUI] Could not set window icon: %s", exc)
+
     def _setup_styles(self):
         """Setup ttk styles."""
         style = ttk.Style()
@@ -253,7 +273,7 @@ class CVManagerApp:
         
         sort_hint = ttk.Label(
             options_frame,
-            text="If unchecked, only new studies are sorted and formatted; existing CV order is preserved.",
+            text="If unchecked, only new studies are sorted and formatted; existing CV order is preserved. Uncheck is RECOMMENDED for large studies",
             foreground='#666666',
             font=('Segoe UI', 9, 'italic')
         )
@@ -544,6 +564,8 @@ class CVManagerApp:
         ttk.Button(study_btn_frame, text="Add Study", command=self._add_study).pack(side=tk.LEFT, padx=2)
         ttk.Button(study_btn_frame, text="Edit Study", command=self._edit_study).pack(side=tk.LEFT, padx=2)
         ttk.Button(study_btn_frame, text="Delete Study", command=self._delete_study).pack(side=tk.LEFT, padx=2)
+        self._undo_btn = ttk.Button(study_btn_frame, text="Undo Delete", command=self._undo_delete, state=tk.DISABLED)
+        self._undo_btn.pack(side=tk.LEFT, padx=2)
         ttk.Button(study_btn_frame, text="Export to .xlsx", command=self._export_site).pack(side=tk.RIGHT, padx=2)
         ttk.Button(study_btn_frame, text="Refresh", command=self._refresh_studies).pack(side=tk.RIGHT, padx=2)
     
@@ -936,10 +958,12 @@ class CVManagerApp:
         idx = selection[0]
         if hasattr(self, '_sites') and idx < len(self._sites):
             site = self._sites[idx]
+            self._undo_buffer.clear_if_site_changed(site.id)
             self.selected_site_id = site.id
             self.studies_header.config(text=f"Studies - {site.name}")
             self._refresh_studies()
             self._refresh_categories()
+            self._sync_undo_btn()
     
     def _refresh_studies(self):
         """Refresh the studies treeview."""
@@ -1301,6 +1325,7 @@ class CVManagerApp:
                     study = Study(**dialog.result)
                     db.add_study(self.selected_site_id, study)
                     self._refresh_studies()
+                    self._refresh_sites()
                     messagebox.showinfo("Success", "Study added successfully!")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to add study: {str(e)}")
@@ -1344,27 +1369,88 @@ class CVManagerApp:
                 messagebox.showerror("Error", f"Failed to update study: {str(e)}")
     
     def _delete_study(self):
-        """Delete selected study."""
+        """Delete selected study, storing it in the undo buffer first."""
         selection = self.studies_tree.selection()
         if not selection:
             messagebox.showwarning("Warning", "Please select a study first")
             return
-        
+
         if not messagebox.askyesno("Confirm Delete", "Are you sure you want to delete this study?"):
             return
-        
+
         study_id = int(selection[0])
-        
+
         try:
             with DatabaseManager(config=self.config) as db:
+                study = db.get_study(study_id, self.selected_site_id)
+                if study is None:
+                    messagebox.showerror("Error", "Study not found")
+                    return
+
+                undo_data = [{
+                    'phase': study.phase,
+                    'subcategory': study.subcategory,
+                    'year': study.year,
+                    'sponsor': study.sponsor,
+                    'protocol': study.protocol,
+                    'description_full': study.description_full,
+                    'description_masked': study.description_masked,
+                }]
+
                 if db.delete_study(study_id, self.selected_site_id):
+                    self._undo_buffer.store(self.selected_site_id, undo_data)
                     self._refresh_studies()
+                    self._refresh_sites()
+                    self._sync_undo_btn()
                     messagebox.showinfo("Success", "Study deleted successfully!")
                 else:
                     messagebox.showerror("Error", "Failed to delete study")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to delete study: {str(e)}")
-    
+
+    def _undo_delete(self):
+        """Undo the most recent delete by restoring studies from the undo buffer."""
+        if not self._undo_buffer.can_undo:
+            self._sync_undo_btn()
+            return
+
+        studies_data = self._undo_buffer.pop()
+        if not studies_data:
+            self._sync_undo_btn()
+            return
+
+        try:
+            with DatabaseManager(config=self.config) as db:
+                restored = 0
+                for sd in studies_data:
+                    study = Study(**sd)
+                    result = db.add_study(self.selected_site_id, study)
+                    if result is not None:
+                        restored += 1
+
+                if restored > 0:
+                    self._refresh_studies()
+                    self._refresh_sites()
+                    self._sync_undo_btn()
+                    messagebox.showinfo(
+                        "Undo",
+                        f"Restored {restored} study(ies) successfully!",
+                    )
+                else:
+                    messagebox.showerror("Error", "Failed to restore studies")
+        except Exception as e:
+            messagebox.showerror("Error", f"Undo failed: {str(e)}")
+
+        self._sync_undo_btn()
+
+    def _sync_undo_btn(self):
+        """Enable or disable the Undo Delete button based on buffer state."""
+        if hasattr(self, '_undo_btn'):
+            if self._undo_buffer.can_undo:
+                self._undo_btn.config(state=tk.NORMAL)
+            else:
+                self._undo_btn.config(state=tk.DISABLED)
+
     def _show_configuration(self):
         """Show configuration dialog."""
         dialog = ConfigurationDialog(self.root, self.config)
@@ -1772,6 +1858,22 @@ class ConfigurationDialog(tk.Toplevel):
         ConfigToolTip(row, get_tooltip_text(key))
         self._vars[key] = var
 
+    def _labeled_float_entry(self, parent, label: str, key: str,
+                              width: int = 10, description: str = "") -> None:
+        row = tk.Frame(parent, bg=self._CARD_BG)
+        row.pack(fill=tk.X, pady=3)
+        tk.Label(row, text=label, font=("Segoe UI", 10), bg=self._CARD_BG,
+                 width=30, anchor="w").pack(side=tk.LEFT)
+        var = tk.StringVar()
+        ent = tk.Entry(row, textvariable=var, width=width,
+                       font=("Segoe UI", 10), relief="solid", bd=1)
+        ent.pack(side=tk.LEFT, padx=(4, 0))
+        if description:
+            tk.Label(row, text=description, font=("Segoe UI", 9, "italic"),
+                     fg="#888888", bg=self._CARD_BG).pack(side=tk.LEFT, padx=(8, 0))
+        ConfigToolTip(row, get_tooltip_text(key))
+        self._vars[key] = var
+
     # ---- sections ----
     def _section_fuzzy(self):
         c = self._card("Fuzzy Matching")
@@ -1822,6 +1924,13 @@ class ConfigurationDialog(tk.Toplevel):
             width=24,
             description='Label for studies without a category match',
         )
+        self._labeled_float_entry(
+            c,
+            "Hanging indent (inches):",
+            "hanging_indent_inches",
+            width=8,
+            description=f'{HANGING_INDENT_MIN}–{HANGING_INDENT_MAX}',
+        )
 
     def _section_retention(self):
         c = self._card("Retention Policy")
@@ -1870,6 +1979,7 @@ class ConfigurationDialog(tk.Toplevel):
         # self._vars["offline_guard_enabled"].set(cfg.offline_guard_enabled)
         # self._vars["enable_sort_existing"].set(cfg.enable_sort_existing)
         self._vars["uncategorized_label"].set(cfg.uncategorized_label)
+        self._vars["hanging_indent_inches"].set(str(cfg.hanging_indent_inches))
 
     def _collect(self) -> dict:
         """Collect values from widgets into a config dict. Raises ValueError on bad input."""
@@ -1891,6 +2001,11 @@ class ConfigurationDialog(tk.Toplevel):
         # d["allow_redaction_without_full_match"] = self._vars["allow_redaction_without_full_match"].get()
         # d["enable_sort_existing"] = self._vars["enable_sort_existing"].get()
         d["uncategorized_label"] = self._vars["uncategorized_label"].get().strip() or "Uncategorized"
+        raw_indent = self._vars["hanging_indent_inches"].get().strip()
+        try:
+            d["hanging_indent_inches"] = float(raw_indent)
+        except (ValueError, TypeError):
+            raise ValueError(f"Hanging indent must be a number, got {raw_indent!r}")
         d["backup_retention_days"] = self._vars["backup_retention_days"].get()
         d["log_retention_days"] = self._vars["log_retention_days"].get()
         # d["offline_guard_enabled"] = self._vars["offline_guard_enabled"].get()

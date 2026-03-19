@@ -3,6 +3,7 @@ Configuration management for the CV Research Experience Manager.
 All settings are local-only with no network capabilities.
 """
 
+import sys
 import os
 import json
 import getpass
@@ -11,7 +12,21 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 
+APP_NAME = "CV Research Experience Manager"
+APP_VERSION = "1.2.0"
+
 DEFAULT_UNCATEGORIZED_LABEL = "Uncategorized"
+
+HANGING_INDENT_MIN = 0.0
+HANGING_INDENT_MAX = 2.0
+HANGING_INDENT_DEFAULT = 0.5
+
+UNDO_TIMEOUT_SECONDS = 300
+
+DEFAULT_ICON_PATH = "build/assets/app.ico"
+BUILD_ICON_PATH = "build/assets/app.ico"
+
+UPDATE_CHECK_URL = "https://api.github.com/repos/vctruong100/Curriculum-Vitae-Manager/releases/latest"
 
 
 ALLOWED_FONTS = [
@@ -27,7 +42,15 @@ ALLOWED_FONTS = [
 
 
 def get_app_root() -> Path:
-    """Get the application root directory (project root, parent of src/)."""
+    """Get the application root directory (project root).
+
+    When frozen (PyInstaller .exe at project root), returns the directory
+    containing the executable.  When running from source, returns the
+    parent of src/.  Both resolve to the same project root where ./data/
+    lives.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.resolve()
     return Path(__file__).parent.parent.resolve()
 
 
@@ -94,6 +117,12 @@ class AppConfig:
     # Offline guard (default ON)
     offline_guard_enabled: bool = True
 
+    # Hanging indentation (inches) for study paragraphs
+    hanging_indent_inches: float = 0.5
+
+    # Optional update checker (disabled by default)
+    check_updates_on_startup: bool = False
+
     def __post_init__(self):
         if not self.data_root:
             self.data_root = str(get_default_data_root())
@@ -122,6 +151,15 @@ class AppConfig:
             _errors.append(f"enable_sort_existing must be bool, got {self.enable_sort_existing!r}")
         if not isinstance(self.uncategorized_label, str) or not self.uncategorized_label.strip():
             _errors.append(f"uncategorized_label must be a non-empty string, got {self.uncategorized_label!r}")
+        if not isinstance(self.hanging_indent_inches, (int, float)):
+            _errors.append(f"hanging_indent_inches must be a number, got {self.hanging_indent_inches!r}")
+        elif not (HANGING_INDENT_MIN <= float(self.hanging_indent_inches) <= HANGING_INDENT_MAX):
+            _errors.append(
+                f"hanging_indent_inches must be {HANGING_INDENT_MIN}–{HANGING_INDENT_MAX}, "
+                f"got {self.hanging_indent_inches!r}"
+            )
+        if not isinstance(self.check_updates_on_startup, bool):
+            _errors.append(f"check_updates_on_startup must be bool, got {self.check_updates_on_startup!r}")
         if self.manual_benchmark_year is not None:
             if not isinstance(self.manual_benchmark_year, int) or not (1900 <= self.manual_benchmark_year <= 2100):
                 _errors.append(f"manual_benchmark_year must be int 1900-2100 or None, got {self.manual_benchmark_year!r}")

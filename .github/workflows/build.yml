@@ -1,0 +1,51 @@
+name: Build Windows Executable
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Run unit tests
+        working-directory: src
+        run: python -m pytest tests/ --tb=short -q
+
+      - name: Build exe
+        env:
+          CONSOLE_MODE: "0"
+        run: python -m PyInstaller --clean --noconfirm cv_manager.spec
+
+      - name: Verify exe exists
+        run: |
+          if (!(Test-Path "CV_Manager.exe")) {
+            Write-Error "CV_Manager.exe not found"
+            exit 1
+          }
+          $size = [math]::Round((Get-Item "CV_Manager.exe").Length / 1MB, 1)
+          Write-Host "Built: CV_Manager.exe ($size MB)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CV_Manager-windows
+          path: CV_Manager.exe
+          retention-days: 30

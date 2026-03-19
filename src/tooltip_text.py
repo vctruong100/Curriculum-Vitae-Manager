@@ -72,6 +72,11 @@ TOOLTIP_TEXT = {
         "Comma-separated list of phases in desired display order. "
         "Controls how phases are sorted in the output document."
     ),
+    "hanging_indent_inches": (
+        "Hanging indentation in inches applied to study paragraphs in "
+        "output .docx files. Valid range is 0.0–2.0. Set to 0 for no "
+        "hanging indent."
+    ),
 }
 
 

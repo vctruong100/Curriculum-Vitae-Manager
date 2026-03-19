@@ -47,7 +47,8 @@ class CVDocxHandler:
     HANGING_INDENT = Inches(0.5)
     
     def __init__(self, file_path: Path, font_name: Optional[str] = None,
-                 font_size: Optional[int] = None):
+                 font_size: Optional[int] = None,
+                 hanging_indent_inches: Optional[float] = None):
         self.file_path = file_path
         self.document = None
         self.research_exp_start_idx = None
@@ -66,6 +67,8 @@ class CVDocxHandler:
             self.FONT_NAME = font_name
         if font_size:
             self.FONT_SIZE = Pt(font_size)
+        if hanging_indent_inches is not None:
+            self.HANGING_INDENT = Inches(hanging_indent_inches)
     
     def load(self) -> None:
         """Load the document."""
@@ -575,8 +578,8 @@ class CVDocxHandler:
         
         # Set paragraph formatting
         para_format = para.paragraph_format
-        para_format.left_indent = Inches(0)
-        para_format.first_line_indent = Inches(-0.5)  # Negative for hanging
+        para_format.left_indent = self.HANGING_INDENT
+        para_format.first_line_indent = -self.HANGING_INDENT
         para_format.space_before = Pt(0)
         para_format.space_after = Pt(0)
         
@@ -1290,8 +1293,9 @@ class CVDocxHandler:
         # Paragraph properties for hanging indent
         pPr = OxmlElement('w:pPr')
         ind = OxmlElement('w:ind')
-        ind.set(qn('w:left'), '720')  # 0.5 inch in twips
-        ind.set(qn('w:hanging'), '720')  # Hanging indent
+        twips = str(int(self.HANGING_INDENT.inches * 1440))
+        ind.set(qn('w:left'), twips)
+        ind.set(qn('w:hanging'), twips)
         pPr.append(ind)
         p.append(pPr)
         

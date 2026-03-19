@@ -614,16 +614,76 @@ py src/benchmark.py --count 10000
 
 ## Packaging
 
-Build a single-file executable with PyInstaller:
+### Prerequisites
 
-```bash
-pip install pyinstaller
-pyinstaller cv_manager.spec
+- Python 3.8+ (64-bit) on Windows
+- Project dependencies: `pip install -r requirements.txt`
+- PyInstaller: `pip install pyinstaller`
+
+### Build Commands
+
+```powershell
+pyinstaller --clean --noconfirm cv_manager.spec
 ```
 
-Output: `dist/CV_Manager.exe` (Windows) or `dist/CV_Manager` (macOS/Linux).
+Or use the helper script:
+```powershell
+.\build\build.ps1
+.\build\build.ps1 -Console
+```
 
-**Font note**: Calibri is bundled with Windows. On macOS/Linux, the app writes Calibri as the font name in .docx output — Word on the target machine handles font substitution if Calibri is unavailable.
+The executable is placed at the **project root** as `CV_Manager.exe`, next to `CV_Manager.bat`.
+
+### Data Storage
+
+Both `CV_Manager.bat` and `CV_Manager.exe` share the same `data/` folder:
+
+```
+Curriculum Vitae/          ← project root
+  CV_Manager.bat           ← source launcher
+  CV_Manager.exe           ← built executable
+  data/
+    config.json            ← shared config
+    users/{username}/
+      sites.db             ← shared database
+      logs/
+      backups/
+      exports/
+      results/
+  result/
+    {CV Name}/
+```
+
+### Console Toggle (Debugging)
+
+To build with a visible console window for debugging:
+```powershell
+$env:CONSOLE_MODE = "1"
+pyinstaller --clean --noconfirm cv_manager.spec
+```
+
+### SmartScreen Warning
+
+The built `.exe` is unsigned. On first launch, Windows SmartScreen may show "Windows protected your PC." Click **More info → Run anyway**. To avoid this, code-sign the executable with a certificate:
+```powershell
+signtool sign /f cert.pfx /p PASSWORD /t http://timestamp.digicert.com CV_Manager.exe
+```
+
+### Smoke Test
+
+After building, verify the `.exe` starts correctly:
+```powershell
+py src/tests/smoke_exe.py
+py src/tests/smoke_exe.py CV_Manager.exe
+```
+
+### Single-Instance Lock
+
+The application prevents multiple GUI instances from writing to the same database simultaneously. If a second instance is launched, it shows a warning dialog and exits. The lock file is stored at `./data/users/{username}/.cv_manager.lock`.
+
+### Font Note
+
+Calibri is bundled with Windows. On macOS/Linux, the app writes Calibri as the font name in `.docx` output — Word on the target machine handles font substitution if Calibri is unavailable.
 
 ---
 
@@ -647,10 +707,5 @@ This is an offline, local application. For issues:
 3. Ensure write permissions to the data directory
 4. Run `py src/main.py --mode validate-master --master "file.xlsx"` to check your master list
 5. Run `py src/main.py --mode validate-cv --cv "file.docx"` to check your CV port
-
-This is an offline, local application. For issues:
-1. Check the logs in `./data/users/{username}/logs/`
-2. Verify file formats match specifications above
-3. Ensure write permissions to data directory
 
 Please let me know if there is any bug/issue or any feature request.

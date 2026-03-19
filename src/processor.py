@@ -243,6 +243,7 @@ class CVProcessor:
                 cv_path,
                 font_name=self.config.font_name,
                 font_size=self.config.font_size,
+                hanging_indent_inches=self.config.hanging_indent_inches,
             )
             handler.load()
             
@@ -789,6 +790,7 @@ class CVProcessor:
                 cv_path,
                 font_name=self.config.font_name,
                 font_size=self.config.font_size,
+                hanging_indent_inches=self.config.hanging_indent_inches,
             )
             handler.load()
 
@@ -989,6 +991,7 @@ class CVProcessor:
                 cv_path,
                 font_name=self.config.font_name,
                 font_size=self.config.font_size,
+                hanging_indent_inches=self.config.hanging_indent_inches,
             )
             handler.load()
 

@@ -376,6 +376,36 @@ class DatabaseManager:
         
         return study
     
+    def get_study(self, study_id: int, site_id: int) -> Optional[Study]:
+        """Get a single study by ID, verifying ownership."""
+        if not self._verify_site_ownership(site_id):
+            return None
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT * FROM studies WHERE id = ? AND site_id = ?
+        ''', (study_id, site_id))
+
+        row = cursor.fetchone()
+        if row is None:
+            return None
+
+        return Study(
+            id=row['id'],
+            site_id=row['site_id'],
+            phase=row['phase'],
+            subcategory=row['subcategory'],
+            year=row['year'],
+            sponsor=row['sponsor'],
+            protocol=row['protocol'] or '',
+            description_full=row['description_full'],
+            description_masked=row['description_masked'],
+            created_at=datetime.fromisoformat(row['created_at']),
+            updated_at=datetime.fromisoformat(row['updated_at']),
+        )
+
     def get_studies(self, site_id: int) -> List[Study]:
         """Get all studies for a site, verifying ownership."""
         if not self._verify_site_ownership(site_id):
