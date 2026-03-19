@@ -622,17 +622,64 @@ py src/benchmark.py --count 10000
 
 ### Build Commands
 
+**One-file build** (default — single `CV_Manager.exe` at project root):
+
+```batch
+build\build_win.bat
+```
 ```powershell
-pyinstaller --clean --noconfirm cv_manager.spec
+.\build\build_win.ps1
 ```
 
-Or use the helper script:
+**One-folder build** (exe + supporting files in `CV_Manager/`):
+
+```batch
+build\build_win.bat onedir
+```
 ```powershell
-.\build\build.ps1
-.\build\build.ps1 -Console
+.\build\build_win.ps1 -BuildMode onedir
 ```
 
-The executable is placed at the **project root** as `CV_Manager.exe`, next to `CV_Manager.bat`.
+**Console build** (visible console for debugging):
+
+```powershell
+.\build\build_win.ps1 -Console
+```
+
+The build scripts handle everything automatically: dependency install, build-number bump, icon generation, artifact cleanup, PyInstaller `--clean`, and shortcut creation.
+
+The backward-compatible entry points still work:
+```powershell
+.\build\build.ps1                # delegates to build_win.ps1
+.\CV_Manager.bat                 # builds then launches
+```
+
+### Application Icon
+
+The build embeds `build/assets/app.ico` into the `.exe`.
+
+**To update the icon:**
+1. Place your custom `.ico` file at `build/assets/feather.ico`
+2. Rebuild — the build script copies `feather.ico` as `app.ico` automatically
+3. If no `feather.ico` is present, a feather-pen icon is generated via Pillow
+
+**If Windows still shows an old icon after rebuild:**
+1. Right-click the pinned taskbar icon → "Unpin from taskbar"
+2. Delete the old `CV_Manager.exe`
+3. Rebuild with `build\build_win.bat`
+4. Re-pin the new `CV_Manager.exe`
+
+Every build bumps a version resource (`build/build_number.txt`) embedded in the `.exe`, which signals Windows to invalidate its icon cache. In rare cases, run `.\build\refresh_shell_cache.ps1` for manual cache-clearing instructions.
+
+### Taskbar Pinning
+
+One-file builds extract to a temp directory on each run, which can cause Windows to show a second taskbar icon when the app is pinned. This is addressed by:
+
+- **AppUserModelID** — set via `src/appid.py` at process startup, ensuring pinned shortcuts and running windows share the same identity
+- **Stable runtime tmpdir** — the one-file build uses `_cv_manager_runtime` as a fixed extraction directory so Windows sees a consistent child-process path
+- **Shortcuts with embedded AppID** — `build/create_shortcut.py` creates Desktop and Start Menu shortcuts that carry the same `AppUserModelID`
+
+**Recommendation:** One-folder builds (`-BuildMode onedir`) give the most stable pinning behavior because there is no temp-directory extraction involved.
 
 ### Data Storage
 
@@ -658,8 +705,12 @@ Curriculum Vitae/          ← project root
 
 To build with a visible console window for debugging:
 ```powershell
-$env:CONSOLE_MODE = "1"
-pyinstaller --clean --noconfirm cv_manager.spec
+.\build\build_win.ps1 -Console
+```
+Or:
+```batch
+set CONSOLE_MODE=1
+build\build_win.bat
 ```
 
 ### SmartScreen Warning
@@ -671,11 +722,13 @@ signtool sign /f cert.pfx /p PASSWORD /t http://timestamp.digicert.com CV_Manage
 
 ### Smoke Test
 
-After building, verify the `.exe` starts correctly:
+After building, verify the build artifacts:
 ```powershell
-py src/tests/smoke_exe.py
-py src/tests/smoke_exe.py CV_Manager.exe
+py scripts/smoke_build_check.py
+py scripts/smoke_build_check.py --launch
 ```
+
+This checks: exe exists, icon exists and is non-empty, version resource matches the current build number, and (with `--launch`) the exe runs and exits cleanly.
 
 ### Single-Instance Lock
 

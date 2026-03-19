@@ -15,7 +15,7 @@ from datetime import datetime
 import re
 
 from config import get_config, set_config, AppConfig, get_os_username, get_app_root, ALLOWED_FONTS, APP_VERSION, APP_NAME, HANGING_INDENT_MIN, HANGING_INDENT_MAX, DEFAULT_ICON_PATH
-from resource_path import resource_path
+from resource_path import resource_path, is_frozen
 from tooltip_text import get_tooltip_text, TOOLTIP_MAX_WIDTH
 from models import Study, Site
 from database import DatabaseManager
@@ -71,9 +71,15 @@ class CVManagerApp:
     def _set_app_icon(self):
         """Set the application window icon from bundled or local assets."""
         try:
-            ico_path = resource_path(DEFAULT_ICON_PATH)
+            # When frozen, assets are bundled at assets/ inside _MEIPASS.
+            # When running from source, assets live at build/assets/ relative to project root.
+            if is_frozen():
+                ico_path = resource_path("assets/app.ico")
+            else:
+                ico_path = resource_path(DEFAULT_ICON_PATH)
+
             if ico_path.exists():
-                self.root.iconbitmap(str(ico_path))
+                self.root.iconbitmap(default=str(ico_path))
                 logging.info("[GUI] Window icon set from %s", ico_path)
             else:
                 logging.debug("[GUI] Icon not found at %s — using default", ico_path)

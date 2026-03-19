@@ -29,6 +29,11 @@ else:
     if str(_app_dir) not in sys.path:
         sys.path.insert(0, str(_app_dir))
 
+# Set AppUserModelID BEFORE any window is created so that pinned taskbar
+# shortcuts and running windows share the same identity on Windows.
+from appid import set_app_user_model_id
+set_app_user_model_id()
+
 from config import get_config, AppConfig, APP_VERSION, APP_NAME
 
 

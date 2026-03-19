@@ -83,7 +83,7 @@ class AppConfig:
     phase_order: List[str] = field(default_factory=lambda: ["Phase I", "Phase II–IV"])
     
     # Security - network disabled
-    network_enabled: bool = False
+    network_enabled: bool = True
     allow_redaction_without_full_match: bool = False
     
     # Storage paths (local only)
@@ -115,13 +115,13 @@ class AppConfig:
     uncategorized_label: str = "Uncategorized"
 
     # Offline guard (default ON)
-    offline_guard_enabled: bool = True
+    offline_guard_enabled: bool = False
 
     # Hanging indentation (inches) for study paragraphs
     hanging_indent_inches: float = 0.5
 
     # Optional update checker (disabled by default)
-    check_updates_on_startup: bool = False
+    check_updates_on_startup: bool = True
 
     def __post_init__(self):
         if not self.data_root:
