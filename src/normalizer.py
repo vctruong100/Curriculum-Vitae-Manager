@@ -65,6 +65,7 @@ def normalize_heading_key(text: str) -> str:
     text = re.sub(r'[–—−‐‑‒―]', '-', text)
     text = re.sub(r'["\u2018\u2019\u201a\u201b]', "'", text)
     text = re.sub(r'["\u201c\u201d\u201e\u201f]', '"', text)
+    text = re.sub(r'\s*/\s*', '/', text)
     return PHASE_SYNONYMS.get(text, text)
 
 def normalize_subcat_key(text: str) -> str:
@@ -75,6 +76,7 @@ def normalize_subcat_key(text: str) -> str:
     text = re.sub(r'[–—−‐‑‒―]', '-', text)
     text = re.sub(r'["\u2018\u2019\u201a\u201b]', "'", text)
     text = re.sub(r'["\u201c\u201d\u201e\u201f]', '"', text)
+    text = re.sub(r'\s*/\s*', '/', text)
     return PHASE_SYNONYMS.get(text, text)
 
 

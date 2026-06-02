@@ -228,6 +228,43 @@ class CVDocxHandler:
         return None
 
     @staticmethod
+    def _split_phase_subcat_heading(text: str):
+        """Split a combined ``Phase X SubcategoryName`` heading.
+
+        Some CVs use a single bold/italic paragraph for both the phase
+        and subcategory, e.g. "Phase I Endocrinology / Metabolic".
+
+        Returns ``(canonical_phase, subcategory_text)`` when the text
+        starts with a recognised Phase prefix followed by additional
+        text.  Returns ``(canonical_phase, None)`` when the text is a
+        standalone phase heading.  Returns ``(None, None)`` when the
+        text does not start with a phase prefix at all.
+
+        Pattern order: longer prefixes first so "Phase II\u2013IV" is
+        tested before "Phase II".
+        """
+        _patterns = [
+            (r'^Phase\s+II\s*[-\u2013\u2014\u2212\u2010\u2011\u2012\u2015]\s*IV\b\s*',
+             'Phase II\u2013IV'),
+            (r'^Phase\s+2\s*[-\u2013\u2014\u2212\u2010\u2011\u2012\u2015]\s*4\b\s*',
+             'Phase II\u2013IV'),
+            (r'^Phase\s+III\b\s*', 'Phase III'),
+            (r'^Phase\s+3\b\s*', 'Phase III'),
+            (r'^Phase\s+IV\b\s*', 'Phase IV'),
+            (r'^Phase\s+4\b\s*', 'Phase IV'),
+            (r'^Phase\s+II\b\s*', 'Phase II'),
+            (r'^Phase\s+2\b\s*', 'Phase II'),
+            (r'^Phase\s+I\b\s*', 'Phase I'),
+            (r'^Phase\s+1\b\s*', 'Phase I'),
+        ]
+        for pat, canonical in _patterns:
+            m = re.match(pat, text, re.IGNORECASE)
+            if m:
+                remaining = text[m.end():].strip()
+                return canonical, remaining if remaining else None
+        return None, None
+
+    @staticmethod
     def _merge_paragraph_text(para) -> str:
         """Merge all runs in a paragraph into a single string.
 
@@ -348,19 +385,41 @@ class CVDocxHandler:
             # Check if this is a phase heading (Phase I, Phase II, etc.)
             phase_name = is_phase_heading(text)
             if phase_name:
+                # Check for combined "Phase X SubcategoryName" heading
+                _, subcat_text = self._split_phase_subcat_heading(text)
                 current_phase = research_exp.get_or_create_phase(phase_name)
-                current_subcategory = None
                 current_sponsor_heading = None
                 p_key = normalize_heading_key(phase_name)
                 self._phase_heading_para[p_key] = i
                 self._phase_last_para[p_key] = i
-                _logging.info(
-                    "[CV Parse] Phase heading detected: raw='%s' "
-                    "canonical='%s' (para index=%d)",
-                    text,
-                    phase_name,
-                    i,
-                )
+
+                if subcat_text:
+                    # Combined heading — set subcategory from the
+                    # trailing text (e.g. "Endocrinology / Metabolic")
+                    subcat_display = normalize_for_display(subcat_text)
+                    current_subcategory = (
+                        current_phase.get_or_create_subcategory(subcat_display)
+                    )
+                    s_key = normalize_subcat_key(subcat_display)
+                    self._subcat_heading_para[(p_key, s_key)] = i
+                    _logging.info(
+                        "[CV Parse] Combined phase+subcat heading: "
+                        "raw='%s' phase='%s' subcat='%s' "
+                        "(para index=%d)",
+                        text,
+                        phase_name,
+                        subcat_display,
+                        i,
+                    )
+                else:
+                    current_subcategory = None
+                    _logging.info(
+                        "[CV Parse] Phase heading detected: raw='%s' "
+                        "canonical='%s' (para index=%d)",
+                        text,
+                        phase_name,
+                        i,
+                    )
                 continue
             
             # Check if this is a study line (starts with 4-digit year)

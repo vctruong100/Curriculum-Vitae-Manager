@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from datetime import datetime
 
+from rapidfuzz import fuzz as _fuzz
 from normalizer import normalize_heading_key, normalize_subcat_key, is_uncategorized_key
 
 
@@ -89,12 +90,21 @@ class Phase:
         for sc in self.subcategories:
             sc.sort_studies()
     
-    def get_or_create_subcategory(self, name: str) -> Subcategory:
+    def get_or_create_subcategory(
+        self, name: str, fuzzy_threshold: int = 85,
+    ) -> Subcategory:
         """Get existing subcategory or create new one.
 
         Matching uses normalize_subcat_key (NFC, casefold, whitespace
-        collapse, dash/quote canonicalization).  The *first* variant
-        seen becomes the persisted display name.
+        collapse, dash/quote/slash canonicalization).  Falls back to
+        fuzzy matching (rapidfuzz ratio) when the normalized key does
+        not match exactly.  The *first* variant seen becomes the
+        persisted display name.
+
+        Args:
+            name: Subcategory display name.
+            fuzzy_threshold: Minimum rapidfuzz ratio (0-100) for the
+                fuzzy fallback.  Set to 0 to disable fuzzy matching.
         """
         key = normalize_subcat_key(name)
         for sc in self.subcategories:
@@ -107,6 +117,28 @@ class Phase:
                     name,
                 )
                 return sc
+
+        # Fuzzy matching fallback
+        if fuzzy_threshold > 0 and self.subcategories:
+            best_match = None
+            best_score = 0
+            for sc in self.subcategories:
+                sc_key = normalize_subcat_key(sc.name)
+                score = _fuzz.ratio(key, sc_key)
+                if score >= fuzzy_threshold and score > best_score:
+                    best_match = sc
+                    best_score = score
+            if best_match:
+                logging.info(
+                    "[Models] Fuzzy matched subcategory '%s' "
+                    "(score=%d, threshold=%d) for requested '%s'",
+                    best_match.name,
+                    best_score,
+                    fuzzy_threshold,
+                    name,
+                )
+                return best_match
+
         new_sc = Subcategory(name=name)
         self.subcategories.append(new_sc)
         logging.debug(

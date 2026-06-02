@@ -76,10 +76,27 @@ pip install -r requirements.txt
 ## Usage
 
 ### GUI Mode (Default)
+
+**Windows (Silent Launch - Recommended)**:
+```batch
+CV_Manager.vbs
+```
+Double-click to launch with no terminal window.
+
+**Windows (With Terminal)**:
+```batch
+CV_Manager.bat
+```
+Shows terminal briefly, useful for debugging.
+
+**macOS/Linux** or **Direct Python**:
 ```bash
 py src/main.py
 ```
+
 Opens the tkinter-based GUI with three tabs: **Update/Inject**, **Redact Protocols**, and **Database Management**.
+
+> **Note**: Both `.vbs` and `.bat` launch directly from Python source, eliminating Windows SmartScreen issues. No `.exe` compilation needed!
 
 ### CLI Mode
 ```bash
@@ -614,13 +631,15 @@ py src/benchmark.py --count 10000
 
 ## Packaging
 
+> **⚠️ Note**: Building the `.exe` is **optional**. The application runs perfectly from Python source via `CV_Manager.bat`, which eliminates Windows SmartScreen issues entirely. Only build the `.exe` if you need a standalone executable for distribution.
+
 ### Prerequisites
 
 - Python 3.8+ (64-bit) on Windows
 - Project dependencies: `pip install -r requirements.txt`
 - PyInstaller: `pip install pyinstaller`
 
-### Build Commands
+### Build Commands (Optional)
 
 **One-file build** (default — single `CV_Manager.exe` at project root):
 
@@ -648,11 +667,7 @@ build\build_win.bat onedir
 
 The build scripts handle everything automatically: dependency install, build-number bump, icon generation, artifact cleanup, PyInstaller `--clean`, and shortcut creation.
 
-The backward-compatible entry points still work:
-```powershell
-.\build\build.ps1                # delegates to build_win.ps1
-.\CV_Manager.bat                 # builds then launches
-```
+**Note**: `CV_Manager.bat` now launches directly from Python source (no build step). To build the `.exe` manually, use the build scripts above.
 
 ### Application Icon
 
@@ -733,6 +748,8 @@ This checks: exe exists, icon exists and is non-empty, version resource matches 
 ### Single-Instance Lock
 
 The application prevents multiple GUI instances from writing to the same database simultaneously. If a second instance is launched, it shows a warning dialog and exits. The lock file is stored at `./data/users/{username}/.cv_manager.lock`.
+
+**Automatic Stale Lock Cleanup**: If the application detects a lock file from a process that is no longer running (e.g., after a crash or forced termination), it automatically removes the stale lock and proceeds. If you encounter lock-related errors, you can also manually delete the lock file or run `cleanup_lock.bat`.
 
 ### Font Note
 
