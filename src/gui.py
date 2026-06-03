@@ -25,6 +25,7 @@ from normalizer import normalize_phase, validate_year
 from progress_dialog import run_with_progress
 from error_handler import FilePermissionError
 from undo_buffer import UndoBuffer
+from user_preferences import UserPreferencesManager, UserPreferences
 
 
 class CVManagerApp:
@@ -33,8 +34,6 @@ class CVManagerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("1000x900")
-        self.root.minsize(800, 900)
         
         # Configuration
         self.config = get_config()
@@ -42,6 +41,22 @@ class CVManagerApp:
         
         # Current user
         self.user_id = self.config.get_user_id()
+        
+        # User preferences
+        self.prefs_manager = UserPreferencesManager(self.user_id, self.config)
+        self.prefs = self.prefs_manager.load()
+        
+        # Apply window preferences
+        # Start with normal geometry first, then apply fullscreen after window is ready
+        self.root.geometry(f"{self.prefs.window_width}x{self.prefs.window_height}")
+        self.root.minsize(800, 900)
+
+        # Defer fullscreen to ensure proper window initialization
+        if self.prefs.fullscreen:
+            self.root.after(250, self._enter_fullscreen_on_startup)
+        
+        # Bind Escape key globally for fullscreen toggle
+        self.root.bind('<Escape>', lambda e: self._toggle_fullscreen() if self.root.attributes('-fullscreen') else None)
         
         # Selected files/site
         self.cv_path: Optional[Path] = None
@@ -67,6 +82,10 @@ class CVManagerApp:
 
         # Refresh sites list
         self._refresh_sites()
+        
+        # Restore Mode D selected site if exists
+        if self.prefs.mode_d_selected_site_id:
+            self._restore_mode_d_site()
     
     def _set_app_icon(self):
         """Set the application window icon from bundled or local assets."""
@@ -123,6 +142,11 @@ class CVManagerApp:
         db_menu.add_separator()
         db_menu.add_command(label="Open Data Folder", command=self._open_data_folder)
         
+        # View menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="View", menu=view_menu)
+        view_menu.add_command(label="Toggle Fullscreen", command=self._toggle_fullscreen, accelerator="Esc")
+        
         # Configuration menu
         config_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Configuration", menu=config_menu)
@@ -172,6 +196,11 @@ class CVManagerApp:
         self.tab_database = ttk.Frame(self.notebook, padding="10")
         self.notebook.add(self.tab_database, text="Mode C: Database")
         self._create_database_tab()
+        
+        # Tab D: Study Browser
+        self.tab_browser = ttk.Frame(self.notebook, padding="10")
+        self.notebook.add(self.tab_browser, text="Mode D: Study Browser")
+        self._create_browser_tab()
     
     def _create_file_selection_frame(self, parent, include_site: bool = True) -> dict:
         """Create a reusable file selection frame."""
@@ -539,13 +568,15 @@ class CVManagerApp:
         self.studies_tree.heading('desc_masked', text='Masked Description', command=lambda: self._sort_studies_column('desc_masked'))
         self.studies_tree.heading('desc_full', text='Full Description', command=lambda: self._sort_studies_column('desc_full'))
         
-        self.studies_tree.column('phase', width=80, minwidth=60)
-        self.studies_tree.column('subcategory', width=100, minwidth=80)
-        self.studies_tree.column('year', width=50, minwidth=40)
-        self.studies_tree.column('sponsor', width=120, minwidth=80)
-        self.studies_tree.column('protocol', width=100, minwidth=60)
-        self.studies_tree.column('desc_masked', width=250, minwidth=150)
-        self.studies_tree.column('desc_full', width=250, minwidth=150)
+        # Set column widths (restore from preferences if available)
+        default_widths = {
+            'phase': 80, 'subcategory': 100, 'year': 50, 'sponsor': 120,
+            'protocol': 100, 'desc_masked': 250, 'desc_full': 250
+        }
+        for col, default_width in default_widths.items():
+            width = self.prefs.mode_c_column_widths.get(col, default_width)
+            minwidth = int(default_width * 0.75)
+            self.studies_tree.column(col, width=width, minwidth=minwidth)
         
         # Place treeview and scrollbars using grid
         self.studies_tree.grid(row=0, column=0, sticky='nsew')
@@ -559,6 +590,9 @@ class CVManagerApp:
         tree_scroll_x.grid(row=1, column=0, sticky='ew')
         
         self.studies_tree.config(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+        
+        # Bind double-click to edit
+        self.studies_tree.bind('<Double-Button-1>', lambda e: self._edit_study())
         
         # Store all studies for filtering
         self._all_studies_data = []
@@ -574,6 +608,16 @@ class CVManagerApp:
         self._undo_btn.pack(side=tk.LEFT, padx=2)
         ttk.Button(study_btn_frame, text="Export to .xlsx", command=self._export_site).pack(side=tk.RIGHT, padx=2)
         ttk.Button(study_btn_frame, text="Refresh", command=self._refresh_studies).pack(side=tk.RIGHT, padx=2)
+    
+    def _create_browser_tab(self):
+        """Create Mode D: Study Browser tab."""
+        from mode_d_browser import StudyBrowserTab
+        self.browser_tab_instance = StudyBrowserTab(self.tab_browser, self.config, self.prefs_manager, self.prefs)
+    
+    def _restore_mode_d_site(self):
+        """Restore Mode D selected site on startup."""
+        if hasattr(self, 'browser_tab_instance'):
+            self.browser_tab_instance._load_studies()
     
     def _create_status_bar(self):
         """Create status bar at bottom of window."""
@@ -593,8 +637,61 @@ class CVManagerApp:
         self.status_var.set(message)
         self.root.update_idletasks()
     
+    def _enter_fullscreen_on_startup(self):
+        """Enter fullscreen mode after window is fully initialized."""
+        try:
+            # Ensure window is drawn and ready - multiple updates for Windows
+            self.root.update_idletasks()
+            self.root.update()
+
+            # First deiconify (show) the window if it was withdrawn
+            self.root.deiconify()
+
+            # On Windows, we need to lift and focus the window first
+            self.root.lift()
+            self.root.focus_force()
+
+            # Small delay to let Windows finish window creation
+            self.root.after(50, self._apply_fullscreen)
+        except Exception as e:
+            logging.warning(f"Failed to enter fullscreen on startup: {e}")
+
+    def _apply_fullscreen(self):
+        """Apply fullscreen attribute after window is fully realized."""
+        try:
+            # Apply fullscreen attribute
+            self.root.attributes('-fullscreen', True)
+            # Force another update to ensure it takes effect
+            self.root.update_idletasks()
+            self.root.update()
+            logging.info("Entered fullscreen mode on startup")
+        except Exception as e:
+            logging.warning(f"Failed to apply fullscreen: {e}")
+
+    def _toggle_fullscreen(self):
+        """Toggle fullscreen mode."""
+        current = self.root.attributes('-fullscreen')
+        new_state = not current
+        self.root.attributes('-fullscreen', new_state)
+        self.prefs.fullscreen = new_state
+        self.prefs_manager.save(self.prefs)
+    
     def _on_close(self):
-        """Handle window close: flush logs, destroy window, exit process."""
+        """Handle window close: save preferences, flush logs, destroy window, exit process."""
+        # Save window state
+        if not self.prefs.fullscreen:
+            self.prefs.window_width = self.root.winfo_width()
+            self.prefs.window_height = self.root.winfo_height()
+        
+        # Save Mode C column widths
+        if hasattr(self, 'studies_tree'):
+            col_widths = {}
+            for col in ('phase', 'subcategory', 'year', 'sponsor', 'protocol', 'desc_masked', 'desc_full'):
+                col_widths[col] = self.studies_tree.column(col, 'width')
+            self.prefs.mode_c_column_widths = col_widths
+        
+        self.prefs_manager.save(self.prefs)
+        
         logging.info("[GUI] Window closed by user — shutting down")
         logging.shutdown()
         try:

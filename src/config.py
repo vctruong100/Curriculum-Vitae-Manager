@@ -13,7 +13,7 @@ from typing import List, Optional
 
 
 APP_NAME = "CV Research Experience Manager"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.4.1"
 
 DEFAULT_UNCATEGORIZED_LABEL = "Uncategorized"
 
