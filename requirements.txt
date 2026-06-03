@@ -1,13 +1,22 @@
 # CV Research Experience Manager - Dependencies
-# Offline-only application - no network dependencies
-# py -m pip install -r requirements.txt
-# py -m pip install pyinstaller
-# py -m PyInstaller --onefile --windowed --name "CV_Manager" --icon=icon.ico launcher.pyw
+# Offline-only application - no network dependencies required
+#
+# Installation Instructions:
+#   1. Ensure Python 3.8+ is installed from python.org
+#   2. Open terminal/command prompt in this folder
+#   3. Run: py -m pip install -r requirements.txt
+#   4. Launch with: CV_Manager.bat (Windows) or run src/main.py directly
+#
+# Optional: Build standalone .exe
+#   py -m pip install pyinstaller
+#   py -m PyInstaller --onefile --windowed --name "CV_Manager" --icon=icon.ico launcher.pyw
 
-python-docx>=0.8.11
-openpyxl>=3.1.2
-rapidfuzz>=3.5.0
-Pillow>=9.0.0
+# Core dependencies (required)
+python-docx>=0.8.11      # Word document processing
+openpyxl>=3.1.2          # Excel file reading/writing
+rapidfuzz>=3.5.0         # Fuzzy string matching for deduplication
+Pillow>=9.0.0            # Image processing for icons
+pywin32>=227             # Windows clipboard support (required for Mode D formatted copy)
 
-# Development / testing (install with: pip install -r requirements.txt)
-pytest>=7.0.0
+# Development / testing (optional - for running tests)
+# Install with: py -m pip install pytest>=7.0.0

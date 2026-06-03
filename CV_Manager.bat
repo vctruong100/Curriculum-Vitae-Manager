@@ -2,7 +2,7 @@
 REM =========================================================================
 REM  CV Research Experience Manager - Launcher
 REM
-REM  Launches the application directly from Python source.
+REM  Auto-installs dependencies and launches the application.
 REM  No .exe needed - eliminates Windows SmartScreen issues entirely.
 REM =========================================================================
 
@@ -28,8 +28,50 @@ if %errorlevel% equ 0 (
     )
 )
 
+REM --- Check / Install Dependencies ---
+echo Checking dependencies...
+%PY% -c "import docx, openpyxl, rapidfuzz, PIL, win32clipboard" >nul 2>nul
+if %errorlevel% neq 0 (
+    echo.
+    echo Dependencies not found. Installing now...
+    echo This may take a few minutes on first run.
+    echo.
+    %PY% -m pip install -r requirements.txt
+    if %errorlevel% neq 0 (
+        echo.
+        echo ERROR: Failed to install dependencies.
+        echo Please check your internet connection or run manually:
+        echo   %PY% -m pip install -r requirements.txt
+        echo.
+        pause
+        exit /b 1
+    )
+    echo.
+    echo Dependencies installed successfully!
+    echo.
+)
+
 REM --- Launch the application ---
 %PY% src\main.py
 
-REM If we get here, the application exited (error or user closed it)
+REM Check if Python execution failed
+if %errorlevel% neq 0 (
+    echo.
+    echo ============================================
+    echo ERROR: Application failed to start
+    echo Exit code: %errorlevel%
+    echo.
+    echo Common causes:
+    echo   - Missing dependencies: Run 'py -m pip install -r requirements.txt'
+    echo   - Python not properly installed
+    echo   - Corrupted source files
+    echo.
+    echo For help, check the logs or run from terminal to see full error.
+    echo ============================================
+    echo.
+    pause
+    exit /b %errorlevel%
+)
+
+REM If we get here, the application exited normally (user closed it)
 REM Exit silently - no need to pause

@@ -26,21 +26,27 @@ class StudyBrowserTab:
         self.config = config
         self.prefs_manager = prefs_manager
         self.prefs = prefs
-        
+
         # State
         self.selected_site_id: Optional[int] = prefs.mode_d_selected_site_id
         self.all_studies: List[Dict] = []
         self.filtered_studies: List[Dict] = []
         self.selected_indices: Set[int] = set()
-        
+
         # Filter state
         self.filter_years: Set[int] = set(prefs.mode_d_filter_years)
         self.filter_phases: Set[str] = set(prefs.mode_d_filter_phases)
         self.filter_subcategories: Set[str] = set(prefs.mode_d_filter_subcategories)
-        
-        # Debounce timer
+
+        # Debounce timers
         self._search_timer = None
-        
+        self._display_timer = None
+
+        # Virtual scrolling state
+        self._visible_rows: List[int] = []  # indices of currently visible rows
+        self._ROW_BATCH_SIZE = 50  # Render rows in batches for smoothness
+        self._SCROLL_DELAY_MS = 10  # Delay between batch renders
+
         self._create_ui()
         self._load_sites()
         if self.selected_site_id:
@@ -180,19 +186,24 @@ class StudyBrowserTab:
         # Single search
         ttk.Label(controls_frame, text="Quick Search:").pack(side=tk.LEFT)
         self.single_search_var = tk.StringVar(value=self.prefs.mode_d_single_search)
-        self.single_search_var.trace('w', lambda *args: self._on_search_change())
+        self._last_single_search = self.prefs.mode_d_single_search
         single_search_entry = ttk.Entry(controls_frame, textvariable=self.single_search_var, width=30)
         single_search_entry.pack(side=tk.LEFT, padx=5)
-        
+        # Use key release with debounce instead of trace for better performance
+        single_search_entry.bind('<KeyRelease>', lambda e: self._on_single_search_debounced())
+
         # Show/Hide Protocol toggle
         self.show_protocol_var = tk.BooleanVar(value=self.prefs.mode_d_show_protocol)
-        protocol_toggle = ttk.Checkbutton(controls_frame, text="Show Protocol", 
-                                          variable=self.show_protocol_var, 
-                                          command=self._refresh_display)
+        protocol_toggle = ttk.Checkbutton(controls_frame, text="Show Protocol",
+                                          variable=self.show_protocol_var,
+                                          command=self._refresh_display_lazy)
         protocol_toggle.pack(side=tk.LEFT, padx=10)
-        
+
         # Filter button
         ttk.Button(controls_frame, text="Filter", command=self._show_filter_dialog).pack(side=tk.LEFT, padx=5)
+
+        # Reset button - clears filters and search
+        ttk.Button(controls_frame, text="Reset", command=self._reset_filters_and_search).pack(side=tk.LEFT, padx=5)
         
         # Select All button
         ttk.Button(controls_frame, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=5)
@@ -296,6 +307,17 @@ class StudyBrowserTab:
         if self._search_timer:
             self.parent.after_cancel(self._search_timer)
         self._search_timer = self.parent.after(SEARCH_DEBOUNCE_MS, self._on_search_change)
+
+    def _on_single_search_debounced(self):
+        """Debounced single search to prevent lag while typing."""
+        current = self.single_search_var.get()
+        if current == self._last_single_search:
+            return  # No change, skip
+        self._last_single_search = current
+
+        if self._search_timer:
+            self.parent.after_cancel(self._search_timer)
+        self._search_timer = self.parent.after(SEARCH_DEBOUNCE_MS, self._on_search_change)
     
     def _on_search_change(self):
         """Handle search input changes."""
@@ -311,58 +333,126 @@ class StudyBrowserTab:
         self.multi_search_text.delete('1.0', tk.END)
         self._on_search_change()
     
+    def _reset_filters_and_search(self):
+        """Reset all filters and search terms."""
+        # Clear search
+        self.single_search_var.set('')
+        self._last_single_search = ''
+        self.multi_search_text.delete('1.0', tk.END)
+
+        # Clear filters
+        self.filter_years.clear()
+        self.filter_phases.clear()
+        self.filter_subcategories.clear()
+
+        # Save to preferences
+        self.prefs.mode_d_single_search = ''
+        self.prefs.mode_d_multi_search = ''
+        self.prefs.mode_d_filter_years = []
+        self.prefs.mode_d_filter_phases = []
+        self.prefs.mode_d_filter_subcategories = []
+        self.prefs_manager.save(self.prefs)
+
+        # Refresh display
+        self._apply_filters()
+        browser_logger.info("Reset all filters and search terms")
+
     def _apply_filters(self):
         """Apply all filters and refresh display."""
-        self.filtered_studies = []
-        
+        # Filter in memory first (fast)
+        filtered = []
+
         # Get search terms
         single_search = self.single_search_var.get().strip().lower()
         multi_search_text = self.multi_search_text.get('1.0', tk.END).strip()
         multi_keywords = [kw.strip().lower() for kw in multi_search_text.split('\n') if kw.strip()]
-        
+
         for study in self.all_studies:
             # Apply year filter
             if self.filter_years and study['year'] not in self.filter_years:
                 continue
-            
+
             # Apply phase filter
             if self.filter_phases and study['phase'] not in self.filter_phases:
                 continue
-            
+
             # Apply subcategory filter
             if self.filter_subcategories and study['subcategory'] not in self.filter_subcategories:
                 continue
-            
+
             # Apply search filters (single search takes priority)
-            searchable = f"{study['phase']} {study['subcategory']} {study['year']} {study['sponsor']} {study['protocol']} {study['description_full']} {study['description_masked']}".lower()
-            
             if single_search:
+                # Fast early exit: check only key fields first
+                if single_search in study['sponsor'].lower() or \
+                   single_search in study['protocol'].lower() or \
+                   single_search in str(study['year']).lower():
+                    filtered.append(study)
+                    continue
+                # Full search if early exit fails
+                searchable = f"{study['phase']} {study['subcategory']} {study['year']} {study['sponsor']} {study['protocol']} {study['description_full']} {study['description_masked']}".lower()
                 if single_search in searchable:
-                    self.filtered_studies.append(study)
+                    filtered.append(study)
             elif multi_keywords:
                 # Study must match ANY keyword (OR logic)
+                searchable = f"{study['phase']} {study['subcategory']} {study['year']} {study['sponsor']} {study['protocol']} {study['description_full']} {study['description_masked']}".lower()
                 if any(kw in searchable for kw in multi_keywords):
-                    self.filtered_studies.append(study)
+                    filtered.append(study)
             else:
-                self.filtered_studies.append(study)
-        
-        self._refresh_display()
+                filtered.append(study)
+
+        self.filtered_studies = filtered
+        self._refresh_display_lazy()
     
     def _refresh_display(self):
-        """Refresh the study display."""
-        # Clear container
+        """Refresh the study display immediately (for small lists)."""
+        self._refresh_display_lazy()
+
+    def _refresh_display_lazy(self):
+        """Refresh display with lazy loading for smooth performance."""
+        # Cancel any pending display update
+        if self._display_timer:
+            self.parent.after_cancel(self._display_timer)
+
+        # Clear container efficiently
         for widget in self.studies_container.winfo_children():
             widget.destroy()
-        
+
         self.selected_indices.clear()
-        
-        # Create study rows
-        for i, study in enumerate(self.filtered_studies):
-            self._create_study_row(i, study)
-        
-        # Update scroll region
+        self._visible_rows = []
+
+        total = len(self.filtered_studies)
+        if total == 0:
+            self.studies_container.update_idletasks()
+            self.canvas.config(scrollregion=self.canvas.bbox('all'))
+            return
+
+        # For small lists, render all at once
+        if total <= self._ROW_BATCH_SIZE:
+            for i, study in enumerate(self.filtered_studies):
+                self._create_study_row(i, study)
+            self.studies_container.update_idletasks()
+            self.canvas.config(scrollregion=self.canvas.bbox('all'))
+        else:
+            # For large lists, render in batches for responsiveness
+            self._render_batch(0, self._ROW_BATCH_SIZE)
+
+    def _render_batch(self, start: int, end: int):
+        """Render a batch of study rows."""
+        batch_end = min(end, len(self.filtered_studies))
+
+        for i in range(start, batch_end):
+            self._create_study_row(i, self.filtered_studies[i])
+
+        # Update scroll region after each batch
         self.studies_container.update_idletasks()
         self.canvas.config(scrollregion=self.canvas.bbox('all'))
+
+        # Schedule next batch if there are more rows
+        if batch_end < len(self.filtered_studies):
+            self._display_timer = self.parent.after(
+                self._SCROLL_DELAY_MS,
+                lambda: self._render_batch(batch_end, batch_end + self._ROW_BATCH_SIZE)
+            )
     
     def _create_study_row(self, index: int, study: Dict):
         """Create a single study row with formatting colors."""
